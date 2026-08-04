@@ -1,0 +1,20 @@
+# Build artifacts
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dev helper files (not for the repo)
+CLAUDE.md
+CLAUDE_GUI_PHASE2.md
+
+# Signed binaries
+keys/

@@ -1,0 +1,30 @@
+[package]
+name = "smbios-spoofer"
+version = "0.1.0"
+edition = "2021"
+description = "UEFI SMBIOS Spoofer — Rust rewrite for learning purposes"
+
+[dependencies]
+# La crate officielle pour programmer en UEFI avec Rust
+# uefi = framework complet (types, tables, protocoles)
+# uefi-services = macros pratiques (entry point, println!)
+uefi = { version = "0.39", features = ["alloc"] }
+
+# Pour manipuler des tableaux UTF-16 sans allocation
+arrayvec = { version = "0.7", default-features = false }
+
+[profile.release]
+opt-level = "s"       # Optimiser pour la taille (important en UEFI)
+lto = true            # Link-Time Optimization
+strip = true          # Enlever les symboles de debug
+panic = "abort"       # Pas d'unwinding — l'UEFI ne le supporte pas
+codegen-units = 1     # Meilleure optimisation
+
+[features]
+default = []
+# Mode headless : zéro sortie console, boot furtif en <100ms
+headless = []
+
+[profile.dev]
+opt-level = 0
+panic = "abort"       # Même en debug, pas d'unwinding

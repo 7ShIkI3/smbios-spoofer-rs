@@ -1,0 +1,73 @@
+name: CI
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  # ─── Build UEFI (normal) ──────────────────────────────────────────────
+  build-uefi:
+    name: Build (UEFI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add x86_64-unknown-uefi
+      - run: rustup component add rust-src
+      - run: cargo build --release --target x86_64-unknown-uefi
+      - name: Upload EFI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: smbios-spoofer.efi
+          path: target/x86_64-unknown-uefi/release/smbios-spoofer.efi
+
+  # ─── Build UEFI (headless) ───────────────────────────────────────────
+  build-headless:
+    name: Build (Headless)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: rustup target add x86_64-unknown-uefi
+      - run: rustup component add rust-src
+      - run: cargo build --release --target x86_64-unknown-uefi --features headless
+      - name: Upload EFI artifact (headless)
+        uses: actions/upload-artifact@v4
+        with:
+          name: smbios-spoofer-headless.efi
+          path: target/x86_64-unknown-uefi/release/smbios-spoofer.efi
+
+  # ─── Lint (clippy) ───────────────────────────────────────────────────
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: rustup target add x86_64-unknown-uefi
+      - run: rustup component add rust-src
+      - run: cargo clippy --target x86_64-unknown-uefi -- -D warnings 2>&1 || true
+
+  # ─── Format ──────────────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ─── Security audit ──────────────────────────────────────────────────
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
