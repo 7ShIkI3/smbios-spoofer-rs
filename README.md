@@ -7,7 +7,7 @@
 A **UEFI framebuffer application** that modifies SMBIOS tables in memory before Windows boots. Written in Rust, renders a GUI via GOP (Graphics Output Protocol). Port of [Acrozi/SmbiosChanger](https://github.com/Acrozi/SmbiosChanger).
 
 <p align="center">
-  <img src=".github/screenshot.png" alt="SMBIOS Spoofer GUI" width="700">
+  <img src="images/spoof.png" alt="SMBIOS Spoofer GUI" width="700">
 </p>
 
 ## Features
