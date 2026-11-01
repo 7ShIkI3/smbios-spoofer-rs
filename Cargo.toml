@@ -1,13 +1,11 @@
 [package]
 name = "smbios-spoofer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "UEFI SMBIOS Spoofer — Rust rewrite for learning purposes"
+description = "UEFI SMBIOS Spoofer — Full SMBIOS Types 0/1/2/3/4/11/17 + GOP GUI + Auto Chainloader"
 
 [dependencies]
 # La crate officielle pour programmer en UEFI avec Rust
-# uefi = framework complet (types, tables, protocoles)
-# uefi-services = macros pratiques (entry point, println!)
 uefi = { version = "0.39", features = ["alloc"] }
 
 # Pour manipuler des tableaux UTF-16 sans allocation
@@ -24,7 +22,10 @@ codegen-units = 1     # Meilleure optimisation
 default = []
 # Mode headless : zéro sortie console, boot furtif en <100ms
 headless = []
+# Active le spoofing d'adresse MAC (SNP StationAddress + NVRAM cleanup).
+spoof-mac = []
+# Active les modules d'architecture agentique expérimentaux (TDT / Hooks / Memory / Sandbox).
+agentic = []
 
 [profile.dev]
 opt-level = 0
-panic = "abort"       # Même en debug, pas d'unwinding

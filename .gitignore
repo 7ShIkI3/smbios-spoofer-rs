@@ -1,5 +1,7 @@
 # Build artifacts
 /target/
+*.efi
+smbios-snapshot-before.json
 
 # IDE
 .vscode/
