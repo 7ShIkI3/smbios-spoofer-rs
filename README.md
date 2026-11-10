@@ -2,14 +2,14 @@
 
 <p align="center">
   <strong>Next-Generation UEFI In-Memory Hardware Identifier Engine & Automated Bootloader</strong><br>
-  <em>Written in pure <code>no_std</code> Rust with GOP Framebuffer GUI, SMBIOS 3.0 64-bit & Type 17 RAM support.</em>
+  <em>Written in pure <code>no_std</code> Rust with GOP Framebuffer GUI, SMBIOS 3.0 64-bit, Type 17 RAM & NVMe/SATA Disk Spoofing.</em>
 </p>
 
 <p align="center">
   <a href="https://github.com/7ShIkI3/smbios-spoofer-rs/releases"><img src="https://img.shields.io/badge/version-0.2.0-blue.svg?style=for-the-badge&logo=git" alt="Version 0.2.0"></a>
   <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust" alt="Rust 1.85+"></a>
   <a href="https://uefi.org"><img src="https://img.shields.io/badge/UEFI-x86__64-2ea44f.svg?style=for-the-badge&logo=gnubash" alt="UEFI x86_64"></a>
-  <a href="https://github.com/7ShIkI3/smbios-spoofer-rs/actions"><img src="https://img.shields.io/badge/tests-121%20passed-success.svg?style=for-the-badge&logo=checkmarx" alt="121 Tests Passed"></a>
+  <a href="https://github.com/7ShIkI3/smbios-spoofer-rs/actions"><img src="https://img.shields.io/badge/tests-125%20passed-success.svg?style=for-the-badge&logo=checkmarx" alt="125 Tests Passed"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational.svg?style=for-the-badge" alt="License MIT"></a>
 </p>
 
@@ -40,13 +40,14 @@ Ported and fundamentally re-engineered from the original C/EDK2 project ([Acrozi
 | **Installation** | ❌ Manual (requires paid/third-party EasyUEFI) | **✅ 100% Automated (`install.bat` / `install.ps1`)** |
 | **SMBIOS 3.0 (64-bit `_SM3_`)** | ❌ Unhandled (casts 64-bit table to 32-bit `_SM_`) | **✅ Full 64-bit Entry Point & Dual-Table Patching** |
 | **RAM DIMM Spoofing (Type 17)** | ❌ None | **✅ Deterministic per-slot RAM serial & asset tags** |
+| **NVMe / SATA Disk Spoofing** | ❌ None | **✅ `EFI_DISK_INFO_PROTOCOL` Identify & Inquiry hooks (NVMe + ATA word-swap)** |
 | **String Table Preservation** | ⚠️ Can overwrite with `\0\0` and truncate table | **✅ Byte-safe in-place padding (zero corruption)** |
 | **UUID Wire Format** | ⚠️ Big-endian string cast | **✅ SMBIOS 2.6+ Mixed-Endian RFC 4122 standard** |
 | **`EFI_SMBIOS_PROTOCOL`** | ❌ None (raw memory only) | **✅ Full PI/DXE FFI protocol sync** |
 | **Windows Chainloading** | ❌ Relies on BIOS BootOrder fallback | **✅ Native `bootmgfw.efi` launch with `DevicePath`** |
 | **AMI Aptio Display Bug** | ❌ Text colors ignored (monochrome/gray) | **✅ GOP Framebuffer GUI (RGBx & BGRx auto-detect)** |
 | **Persistence Engine** | ⚠️ Single volume only | **✅ Multi-volume ESP scan (`\EFI\SmbiosSpoofer\uuid.dat`)** |
-| **Unit Test Suite** | ❌ None | **✅ 121 Host & Integration Tests passing** |
+| **Unit Test Suite** | ❌ None | **✅ 125 Host & Integration Tests passing** |
 
 ---
 
@@ -91,6 +92,9 @@ flowchart TD
 | **OEM Strings** | Type 11 | Variable | Deterministic per-profile obfuscation (preserves punctuation) |
 | **RAM DIMM Serials** | Type 17 | `0x18` | **Deterministic per-slot DDR4/DDR5 serials** (e.g. Kingston, Corsair) |
 | **RAM DIMM Asset Tags**| Type 17 | `0x19` | Memory module asset tags |
+| **NVMe Disk Serial** | `EFI_DISK_INFO` | `4..24` | 4096-byte `NVMe Identify Controller` `SN` (hook + DXE buffer patch) |
+| **SATA / AHCI Disk Serial**| `EFI_DISK_INFO` | `20..40` | 512-byte `ATA IDENTIFY DEVICE` words `10..19` (**word-swapped ASCII**) |
+| **SCSI / USB Inquiry** | `EFI_DISK_INFO` | `36..56` | Extended `SCSI INQUIRY` vendor-specific serial patch |
 | **Network MAC Address**| SNP / NVRAM | — | Locally administered unicast MAC (via `--features spoof-mac`) |
 
 ---
@@ -185,6 +189,7 @@ smbios-spoofer-rs/
 │   ├── patch.rs             # In-memory table modification engine & checksum recalculation
 │   ├── persistence.rs       # Multi-volume ESP persistence (uuid.dat) & NVRAM variable engine
 │   ├── utils.rs             # Hardware TSC/RTC RNG, RFC 4122 mixed-endian UUID & vendor logic
+│   ├── spoof_disk.rs        # NVMe / SATA / SCSI disk serial spoofer via EFI_DISK_INFO_PROTOCOL
 │   ├── spoof_net.rs         # Optional MAC address spoofer via UEFI SNP protocol
 │   └── agentic.rs           # Optional autonomous decision engine (gated behind feature flag)
 ├── tests/

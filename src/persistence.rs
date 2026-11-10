@@ -39,7 +39,7 @@ const NVRAM_VENDOR_GUID: Guid = Guid::new(
 
 pub const NVRAM_VARIABLE_NAME: &CStr16 = cstr16!("SmbiosSpoof");
 pub const NVRAM_MAGIC: u32 = 0x534D4249; // "SMBI"
-pub const NVRAM_VERSION: u32 = 8; // v8: +asset_tags, +system_sku, +ram_serial_seed, +oem_seed
+pub const NVRAM_VERSION: u32 = 9; // v9: +disk_serial, +disk_serial_seed (v8: +asset_tags, +system_sku, +ram_serial_seed, +oem_seed)
 
 pub const EFI_ROOT_DIR: &CStr16 = cstr16!("\\EFI");
 pub const DISK_DIR: &CStr16 = cstr16!("\\EFI\\SmbiosSpoofer");
@@ -61,7 +61,7 @@ pub struct PersistenceStatus {
 #[derive(Clone, Copy)]
 pub struct SpoofConfig {
     pub magic: u32,                  // 0x534D4249 ("SMBI")
-    pub version: u32,                // Version de la structure (8)
+    pub version: u32,                // Version de la structure (9)
     pub uuid: [u8; 16],              // UUID système (Type 1)
     pub system_serial: [u16; 64],    // Serial système (Type 1)
     pub bios_serial: [u16; 64],      // Réservé / Serial BIOS
@@ -79,6 +79,9 @@ pub struct SpoofConfig {
     pub system_sku: [u16; 64],          // SKU Number système (Type 1) — v8+
     pub ram_serial_seed: u32,           // Graine déterministe pour les barrettes RAM (Type 17) — v8+
     pub oem_seed: u32,                  // Graine déterministe pour les chaînes OEM (Type 11) — v8+
+    // Nouveaux champs v9 (Disk Spoofing) :
+    pub disk_serial: [u16; 64],         // Serial disque principal (NVMe / SATA) — v9+
+    pub disk_serial_seed: u32,          // Graine déterministe pour tous les disques — v9+
     pub checksum: u32,                  // Checksum d'intégrité (somme des octets précédents)
 }
 
@@ -103,6 +106,8 @@ impl Default for SpoofConfig {
             system_sku: [0u16; 64],
             ram_serial_seed: 0,
             oem_seed: 0,
+            disk_serial: [0u16; 64],
+            disk_serial_seed: 0,
             checksum: 0,
         }
     }
@@ -176,6 +181,11 @@ impl SpoofConfig {
 
         self.ram_serial_seed = utils::random_u32() | 1;
         self.oem_seed = utils::random_u32() | 1;
+        self.disk_serial_seed = utils::random_u32() | 1;
+
+        let mut disk_buf = [0u16; 64];
+        utils::generate_disk_serial_deterministic(&mut disk_buf, &[0u16; 64], self.disk_serial_seed, 0);
+        self.disk_serial = disk_buf;
 
         #[cfg(feature = "spoof-mac")]
         {
@@ -258,6 +268,16 @@ impl SpoofConfig {
 
         self.ram_serial_seed = utils::random_u32() | 1;
         self.oem_seed = utils::random_u32() | 1;
+        self.disk_serial_seed = utils::random_u32() | 1;
+
+        let mut disk_buf = [0u16; 64];
+        utils::generate_disk_serial_deterministic(
+            &mut disk_buf,
+            &orig.first_disk_serial,
+            self.disk_serial_seed,
+            0,
+        );
+        self.disk_serial = disk_buf;
 
         #[cfg(feature = "spoof-mac")]
         {
@@ -330,6 +350,14 @@ impl SpoofConfig {
         if self.oem_seed == 0 {
             self.oem_seed = utils::random_u32() | 1;
         }
+        if self.disk_serial_seed == 0 {
+            self.disk_serial_seed = utils::random_u32() | 1;
+        }
+        if self.disk_serial[0] == 0 {
+            let mut buf = [0u16; 64];
+            utils::generate_disk_serial_deterministic(&mut buf, &[0u16; 64], self.disk_serial_seed, 0);
+            self.disk_serial = buf;
+        }
 
         #[cfg(feature = "spoof-mac")]
         if self.mac_address == [0u8; 6] {
@@ -372,6 +400,27 @@ impl SpoofConfig {
             let mut bd_buf = [0u16; 64];
             utils::generate_bios_date_like(&mut bd_buf, &orig.bios_date);
             self.bios_date = bd_buf;
+            modified = true;
+        }
+
+        let orig_disk_len = utils::str_len(&orig.first_disk_serial).min(20);
+        let curr_disk = self.disk_serial;
+        if orig_disk_len > 0 && utils::str_len(&curr_disk) != orig_disk_len {
+            let seed = if self.disk_serial_seed == 0 {
+                let s = utils::random_u32() | 1;
+                self.disk_serial_seed = s;
+                s
+            } else {
+                self.disk_serial_seed
+            };
+            let mut disk_buf = [0u16; 64];
+            utils::generate_disk_serial_deterministic(
+                &mut disk_buf,
+                &orig.first_disk_serial,
+                seed,
+                0,
+            );
+            self.disk_serial = disk_buf;
             modified = true;
         }
 

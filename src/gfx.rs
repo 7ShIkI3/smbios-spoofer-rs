@@ -272,8 +272,9 @@ fn text_width(text: &str) -> usize {
 
 // ─── État des étapes (panneau gauche) ─────────────────────────────────────
 
-static mut STEP_TEXTS: [Option<String>; 6] = [None, None, None, None, None, None];
-static mut STEP_STATUS: [Option<bool>; 6] = [None, None, None, None, None, None];
+const MAX_STEPS: usize = 8;
+static mut STEP_TEXTS: [Option<String>; MAX_STEPS] = [None, None, None, None, None, None, None, None];
+static mut STEP_STATUS: [Option<bool>; MAX_STEPS] = [None, None, None, None, None, None, None, None];
 
 fn redraw_steps(gfx: &mut Gfx) {
     let left_x = MARGIN;
@@ -282,7 +283,7 @@ fn redraw_steps(gfx: &mut Gfx) {
     unsafe {
         let texts_ptr = addr_of_mut!(STEP_TEXTS);
         let status_ptr = addr_of_mut!(STEP_STATUS);
-        for i in 0..6 {
+        for i in 0..MAX_STEPS {
             if let Some(ref text) = (*texts_ptr)[i] {
                 let y = start_y + i * LINE_H * 2 + 4;
                 gfx.fill_rect(left_x - 6, y - 3, PANEL_W, LINE_H + 6, C_PANEL);
@@ -335,7 +336,7 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
     crate::utils::format_uuid(&ctx.orig.uuid, &mut uuid_buf);
     crate::utils::format_uuid(&ctx.config.uuid, &mut spoof_uuid_buf);
 
-    let line_y = |idx: usize| start_y + 22 + idx * LINE_H;
+    let line_y = |idx: usize| start_y + 20 + idx * LINE_H;
 
     draw_field(gfx, right_x, line_y(0), "UUID (orig)", &u16_to_string(&uuid_buf), C_GRAY);
     draw_field(gfx, right_x, line_y(1), "UUID (new) ", &u16_to_string(&spoof_uuid_buf), C_OK);
@@ -344,6 +345,7 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
     let bs = ctx.config.baseboard_serial;
     let ps = ctx.config.processor_serial;
     let cs = ctx.config.chassis_serial;
+    let ds = ctx.config.disk_serial;
 
     draw_field_u16(gfx, right_x, line_y(3), "System Serial", &ctx.orig.system_serial, C_GRAY);
     draw_field_u16(gfx, right_x, line_y(4), "  -> new     ", &ss, C_OK);
@@ -358,20 +360,24 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
     let bv = ctx.config.bios_vendor;
     let bver = ctx.config.bios_version;
     let bd = ctx.config.bios_date;
-    draw_field_u16(gfx, right_x, line_y(12), "BIOS Vendor  ", &ctx.orig.bios_vendor, C_GRAY);
-    draw_field_u16(gfx, right_x, line_y(13), "  -> new     ", &bv, C_OK);
-    draw_field_u16(gfx, right_x, line_y(14), "BIOS Version ", &ctx.orig.bios_version, C_GRAY);
-    draw_field_u16(gfx, right_x, line_y(15), "  -> new     ", &bver, C_OK);
-    draw_field_u16(gfx, right_x, line_y(16), "BIOS Date    ", &ctx.orig.bios_date, C_GRAY);
-    draw_field_u16(gfx, right_x, line_y(17), "  -> new     ", &bd, C_OK);
+    draw_field_u16(gfx, right_x, line_y(11), "BIOS Vendor  ", &ctx.orig.bios_vendor, C_GRAY);
+    draw_field_u16(gfx, right_x, line_y(12), "  -> new     ", &bv, C_OK);
+    draw_field_u16(gfx, right_x, line_y(13), "BIOS Version ", &ctx.orig.bios_version, C_GRAY);
+    draw_field_u16(gfx, right_x, line_y(14), "  -> new     ", &bver, C_OK);
+    draw_field_u16(gfx, right_x, line_y(15), "BIOS Date    ", &ctx.orig.bios_date, C_GRAY);
+    draw_field_u16(gfx, right_x, line_y(16), "  -> new     ", &bd, C_OK);
 
-    // Type 17 RAM DIMMs
-    let ram_info = alloc::format!(
-        "{} stick(s) patched (seed 0x{:08X})",
+    // Disk Serial (NVMe / SATA / AHCI)
+    draw_field_u16(gfx, right_x, line_y(17), "Disk Serial  ", &ctx.orig.first_disk_serial, C_GRAY);
+    draw_field_u16(gfx, right_x, line_y(18), "  -> new     ", &ds, C_OK);
+
+    // Type 17 RAM DIMMs + Disks Patched
+    let hw_info = alloc::format!(
+        "RAM: {} stick(s) | Disks: {} drive(s) (NVMe/SATA)",
         ctx.patch_report.type17_patched,
-        { ctx.config.ram_serial_seed }
+        ctx.disk_spoofed_count
     );
-    draw_field(gfx, right_x, line_y(19), "RAM DIMMs    ", &ram_info, C_CYAN);
+    draw_field(gfx, right_x, line_y(20), "HW Devices   ", &hw_info, C_CYAN);
 
     // Persistance status
     let persist_str = alloc::format!(
@@ -380,7 +386,7 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
         if ctx.persist_status.disk_ok { "OK" } else { "NO" },
         if ctx.loaded_from_storage { "Saved Profile" } else { "New Profile" }
     );
-    draw_field(gfx, right_x, line_y(20), "Persistence  ", &persist_str, C_ACCENT);
+    draw_field(gfx, right_x, line_y(21), "Persistence  ", &persist_str, C_ACCENT);
 
     #[cfg(feature = "spoof-mac")]
     {
@@ -392,14 +398,14 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
             ctx.mac_spoofed_count,
             ctx.nvram_mac_spoofed_count
         );
-        draw_field(gfx, right_x, line_y(21), "MAC Address  ", &mac_str, C_ACCENT);
+        draw_field(gfx, right_x, line_y(22), "MAC Address  ", &mac_str, C_ACCENT);
     }
 
     draw_text(
         gfx,
         right_x,
-        line_y(23),
-        "All SMBIOS tables + checksums patched.",
+        line_y(24),
+        "All SMBIOS + RAM + Disk tables patched.",
         C_OK,
     );
 }
@@ -471,7 +477,7 @@ pub fn print_banner() {
         let sub = "ACROZI x 7ShIkI3 — Rust Bare-Metal Edition";
         let sub_x = gfx.width.saturating_sub(text_width(sub)) / 2;
         draw_text(gfx, sub_x, 36, sub, C_WHITE);
-        let hint = "Type 0/1/2/3/4/11/17 (RAM) + NVRAM/ESP Persistence + Windows Auto-Chainload";
+        let hint = "Type 0/1/2/3/4/11/17 (RAM) + NVMe/SATA Disk Spoof + NVRAM/ESP + Auto-Chainload";
         let hint_x = gfx.width.saturating_sub(text_width(hint)) / 2;
         draw_text(gfx, hint_x, 54, hint, C_GRAY);
     });
@@ -481,7 +487,7 @@ pub fn print_step(num: u8, total: u8, text: &str) {
     if cfg!(feature = "headless") {
         return;
     }
-    let idx = (num as usize).saturating_sub(1).min(5);
+    let idx = (num as usize).saturating_sub(1).min(MAX_STEPS - 1);
     let step_text = alloc::format!("[{}/{}] {}...", num, total, text);
     unsafe {
         let texts_ptr = addr_of_mut!(STEP_TEXTS);
@@ -499,7 +505,7 @@ pub fn print_step_ok() {
     unsafe {
         let texts_ptr = addr_of_mut!(STEP_TEXTS);
         let status_ptr = addr_of_mut!(STEP_STATUS);
-        for i in (0..6).rev() {
+        for i in (0..MAX_STEPS).rev() {
             if (*texts_ptr)[i].is_some() && (*status_ptr)[i].is_none() {
                 (*status_ptr)[i] = Some(true);
                 break;
@@ -516,7 +522,7 @@ pub fn print_step_fail(reason: &str) {
     unsafe {
         let texts_ptr = addr_of_mut!(STEP_TEXTS);
         let status_ptr = addr_of_mut!(STEP_STATUS);
-        for i in (0..6).rev() {
+        for i in (0..MAX_STEPS).rev() {
             if (*texts_ptr)[i].is_some() && (*status_ptr)[i].is_none() {
                 (*status_ptr)[i] = Some(false);
                 break;
@@ -525,7 +531,7 @@ pub fn print_step_fail(reason: &str) {
     }
     with_gfx(|gfx| {
         redraw_steps(gfx);
-        let y = BANNER_H + 20 + 6 * LINE_H * 2 + 20;
+        let y = BANNER_H + 20 + MAX_STEPS * LINE_H * 2 + 20;
         draw_text(gfx, MARGIN, y, reason, C_FAIL);
     });
 }
@@ -537,7 +543,7 @@ pub fn print_step_skipped() {
     unsafe {
         let texts_ptr = addr_of_mut!(STEP_TEXTS);
         let status_ptr = addr_of_mut!(STEP_STATUS);
-        for i in (0..6).rev() {
+        for i in (0..MAX_STEPS).rev() {
             if (*texts_ptr)[i].is_some() && (*status_ptr)[i].is_none() {
                 (*status_ptr)[i] = Some(true);
                 break;

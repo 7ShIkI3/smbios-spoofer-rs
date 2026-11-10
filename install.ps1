@@ -56,7 +56,7 @@ function Write-Banner {
     Write-Host ""
     Write-Host "  ======================================================================" -ForegroundColor Cyan
     Write-Host "    EFI SMBIOS SPOOFER v0.2.0 -- Automatic Installer & Boot Manager" -ForegroundColor Yellow
-    Write-Host "    SMBIOS 2.x & 3.0 (64-bit) | Type 0/1/2/3/4/11/17 (RAM) | Zero EasyUEFI" -ForegroundColor Gray
+    Write-Host "    SMBIOS 2.x & 3.0 | Type 0/1/2/3/4/11/17 (RAM) + NVMe/SATA Disk Spoof" -ForegroundColor Gray
     Write-Host "  ======================================================================" -ForegroundColor Cyan
     Write-Host ""
 }
@@ -127,6 +127,7 @@ function Get-CurrentSmbiosSnapshot {
     $enc    = Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction SilentlyContinue | Select-Object -First 1
     $cpu    = Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
     $rams   = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction SilentlyContinue)
+    $disks  = @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction SilentlyContinue)
 
     $ramSerials = @()
     foreach ($r in $rams) {
@@ -135,6 +136,15 @@ function Get-CurrentSmbiosSnapshot {
             Manufacturer  = [string]$r.Manufacturer
             PartNumber    = ([string]$r.PartNumber).Trim()
             SerialNumber  = ([string]$r.SerialNumber).Trim()
+        }
+    }
+
+    $diskDrives = @()
+    foreach ($d in $disks) {
+        $diskDrives += [PSCustomObject]@{
+            Model        = ([string]$d.Model).Trim()
+            Interface    = ([string]$d.InterfaceType).Trim()
+            SerialNumber = ([string]$d.SerialNumber).Trim()
         }
     }
 
@@ -155,6 +165,7 @@ function Get-CurrentSmbiosSnapshot {
         BiosVersion       = [string]$bios.SMBIOSBIOSVersion
         BiosReleaseDate   = if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString("yyyy-MM-dd") } else { "" }
         RamModules        = $ramSerials
+        DiskDrives        = $diskDrives
     }
 }
 
@@ -164,6 +175,13 @@ function Save-PreSpoofSnapshotIfNeeded {
         $snap = Get-CurrentSmbiosSnapshot
         $snap | ConvertTo-Json -Depth 5 | Set-Content -Path $SnapshotFile -Encoding UTF8
         Write-Ok "Hardware snapshot saved ($SnapshotFile)"
+    } else {
+        $existing = Get-Content -Path $SnapshotFile -Raw | ConvertFrom-Json
+        if (-not $existing.PSObject.Properties["DiskDrives"]) {
+            $curr = Get-CurrentSmbiosSnapshot
+            $existing | Add-Member -NotePropertyName "DiskDrives" -NotePropertyValue $curr.DiskDrives -Force
+            $existing | ConvertTo-Json -Depth 5 | Set-Content -Path $SnapshotFile -Encoding UTF8
+        }
     }
 }
 
@@ -212,7 +230,7 @@ function Invoke-ProjectBuild {
         if ($LASTEXITCODE -ne 0) {
             throw "Unit tests failed. Aborting build."
         }
-        Write-Ok "All unit tests passed (121/121)"
+        Write-Ok "All unit tests passed (125/125)"
     }
 
     $features = @()
@@ -440,6 +458,17 @@ function Invoke-StatusCheck {
         $currDisplay = "$($rm.SerialNumber) ($($rm.PartNumber))"
         $prevDisplay = if ($prevSerial) { "$prevSerial ($($rm.PartNumber))" } else { "" }
         Show-FieldComparison ("RAM[$i] Serial") $currDisplay $prevDisplay
+    }
+
+    for ($i = 0; $i -lt $curr.DiskDrives.Count; $i++) {
+        $dd = $curr.DiskDrives[$i]
+        $prevDiskSerial = ""
+        if ($prev -and $prev.DiskDrives -and $i -lt @($prev.DiskDrives).Count) {
+            $prevDiskSerial = [string](@($prev.DiskDrives)[$i].SerialNumber)
+        }
+        $currDiskDisplay = "$($dd.SerialNumber) ($($dd.Model))"
+        $prevDiskDisplay = if ($prevDiskSerial) { "$prevDiskSerial ($($dd.Model))" } else { "" }
+        Show-FieldComparison ("Disk[$i] Serial") $currDiskDisplay $prevDiskDisplay
     }
     Write-Host ""
 

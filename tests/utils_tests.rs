@@ -149,6 +149,23 @@ fn test_ram_serial_deterministic() {
     assert_eq!(str_len_u16(&s0_a), 8);
 }
 
+#[test]
+fn test_disk_serial_deterministic_and_format() {
+    let orig = make_test_serial(b"0000_0000_0100_0000_4CE0_0019_51C2_5D02.");
+    let mut d0_a = [0u16; 64];
+    let mut d0_b = [0u16; 64];
+    let mut d1 = [0u16; 64];
+    generate_disk_serial_deterministic(&mut d0_a, &orig, 0xCAFEBABE, 0);
+    generate_disk_serial_deterministic(&mut d0_b, &orig, 0xCAFEBABE, 0);
+    generate_disk_serial_deterministic(&mut d1, &orig, 0xCAFEBABE, 1);
+    assert!(slice_eq_u16(&d0_a, &d0_b));
+    assert!(!slice_eq_u16(&d0_a, &d1));
+    // Capped at 20 chars (standard ATA/NVMe Identify SN length) and underscores preserved
+    assert_eq!(str_len_u16(&d0_a), 20);
+    assert_eq!(d0_a[4], b'_' as u16);
+    assert_eq!(d0_a[9], b'_' as u16);
+}
+
 fn make_test_serial(bytes: &[u8]) -> [u16; 64] {
     let mut a = [0u16; 64];
     for (i, c) in bytes.iter().enumerate() {

@@ -38,6 +38,9 @@ pub struct OriginalSmbiosData {
     pub ram_dimm_count: usize,
     pub first_ram_serial: [u16; 64],
     pub first_ram_part: [u16; 64],
+    pub disk_count: usize,
+    pub first_disk_serial: [u16; 64],
+    pub first_disk_model: [u16; 64],
 }
 
 impl Default for OriginalSmbiosData {
@@ -61,6 +64,9 @@ impl Default for OriginalSmbiosData {
             ram_dimm_count: 0,
             first_ram_serial: [0u16; 64],
             first_ram_part: [0u16; 64],
+            disk_count: 0,
+            first_disk_serial: [0u16; 64],
+            first_disk_model: [0u16; 64],
         }
     }
 }

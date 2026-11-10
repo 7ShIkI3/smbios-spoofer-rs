@@ -885,6 +885,91 @@ pub fn generate_ram_serial_deterministic(
     buf[len] = 0;
 }
 
+/// Génère un numéro de série de disque (NVMe / SATA / ATA) en respectant la longueur
+/// et le format du numéro de série original (jusqu'à 20 caractères pour ATA/NVMe standard),
+/// ou un numéro de série alphanumérique réaliste de 15 caractères si l'original est vide.
+pub fn generate_disk_serial_matching(buf: &mut [u16; 64], original: &[u16]) {
+    buf.fill(0);
+    let orig_len = str_len_u16(original);
+    if orig_len == 0 || is_placeholder(original) {
+        let len = if orig_len == 0 { 15 } else { orig_len.min(20) };
+        generate_serial(buf, len);
+        return;
+    }
+    let capped_len = orig_len.min(20);
+    let mut trimmed_orig = [0u16; 64];
+    trimmed_orig[..capped_len].copy_from_slice(&original[..capped_len]);
+    generate_serial_matching_format(buf, &trimmed_orig);
+}
+
+/// Génère un numéro de série de disque déterministe par disque (`seed` + `disk_index`),
+/// afin que chaque disque physique conserve un numéro de série stable d'un boot à l'autre
+/// tout en respectant le masque de caractères du disque d'origine (ex: `S4EVNF0M123456A` ou `ABCD_1234_5678_90AB.`).
+pub fn generate_disk_serial_deterministic(
+    buf: &mut [u16; 64],
+    original: &[u16],
+    seed: u32,
+    disk_index: u32,
+) {
+    buf.fill(0);
+    let mut state = seed
+        .wrapping_add(disk_index.wrapping_mul(0x9E37_79B9))
+        .wrapping_add(0xD15C_5EED);
+    if state == 0 {
+        state = 0x4E56_4D45;
+    }
+    let next_u32 = |s: &mut u32| -> u32 {
+        *s ^= *s << 13;
+        *s ^= *s >> 17;
+        *s ^= *s << 5;
+        *s
+    };
+
+    let orig_len = str_len_u16(original);
+    let len = if orig_len == 0 { 15 } else { orig_len.min(20) };
+
+    if orig_len == 0 || is_placeholder(original) {
+        for item in buf.iter_mut().take(len) {
+            let r = (next_u32(&mut state) as usize) % SERIAL_CHARSET.len();
+            *item = SERIAL_CHARSET[r] as u16;
+        }
+        buf[len] = 0;
+        return;
+    }
+
+    if is_likely_hex_serial(&original[..len]) {
+        for i in 0..len {
+            let ch = original[i];
+            let b = (ch & 0xFF) as u8;
+            if b.is_ascii_hexdigit() {
+                let r = (next_u32(&mut state) as usize) % HEX_UPPER.len();
+                buf[i] = HEX_UPPER[r] as u16;
+            } else {
+                buf[i] = ch;
+            }
+        }
+        buf[len] = 0;
+        return;
+    }
+
+    for i in 0..len {
+        let ch = original[i];
+        let b = (ch & 0xFF) as u8;
+        let r = next_u32(&mut state) as usize;
+        if b.is_ascii_digit() {
+            buf[i] = DIGITS[r % DIGITS.len()] as u16;
+        } else if b.is_ascii_uppercase() {
+            buf[i] = UPPER_LETTERS[r % UPPER_LETTERS.len()] as u16;
+        } else if b.is_ascii_lowercase() {
+            buf[i] = LOWER_LETTERS[r % LOWER_LETTERS.len()] as u16;
+        } else {
+            // Préserve les séparateurs de format NVMe/EUI (`_`, `-`, `.`)
+            buf[i] = ch;
+        }
+    }
+    buf[len] = 0;
+}
+
 // ─── Délai UEFI ─────────────────────────────────────────────────────────────
 
 /// Attend un certain nombre de microsecondes via l'UEFI `Stall()`.

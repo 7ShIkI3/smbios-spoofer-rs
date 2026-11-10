@@ -19,9 +19,11 @@ panic = "abort"       # Pas d'unwinding — l'UEFI ne le supporte pas
 codegen-units = 1     # Meilleure optimisation
 
 [features]
-default = []
+default = ["spoof-disk"]
 # Mode headless : zéro sortie console, boot furtif en <100ms
 headless = []
+# Active le spoofing des numéros de série de disques NVMe / SATA / AHCI (EFI_DISK_INFO_PROTOCOL).
+spoof-disk = []
 # Active le spoofing d'adresse MAC (SNP StationAddress + NVRAM cleanup).
 spoof-mac = []
 # Active les modules d'architecture agentique expérimentaux (TDT / Hooks / Memory / Sandbox).

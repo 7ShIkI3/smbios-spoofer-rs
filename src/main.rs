@@ -19,6 +19,7 @@ pub mod gfx;
 pub mod patch;
 pub mod persistence;
 pub mod smbios;
+pub mod spoof_disk;
 #[cfg(feature = "spoof-mac")]
 pub mod spoof_net;
 pub mod utils;
@@ -64,6 +65,7 @@ pub struct SpooferContext {
     pub orig: OriginalSmbiosData,
     pub patch_report: PatchReport,
     pub persist_status: PersistenceStatus,
+    pub disk_spoofed_count: u32,
     pub mac_spoofed_count: u32,
     pub nvram_mac_spoofed_count: u32,
     pub loaded_from_storage: bool,
@@ -83,6 +85,7 @@ impl SpooferContext {
             orig: OriginalSmbiosData::default(),
             patch_report: PatchReport::default(),
             persist_status: PersistenceStatus::default(),
+            disk_spoofed_count: 0,
             mac_spoofed_count: 0,
             nvram_mac_spoofed_count: 0,
             loaded_from_storage: false,
@@ -92,15 +95,10 @@ impl SpooferContext {
 
 // ─── Étapes d'affichage ────────────────────────────────────────────────
 
-#[cfg(all(target_os = "uefi", feature = "spoof-mac"))]
-const TOTAL_STEPS: u8 = 5;
-#[cfg(all(target_os = "uefi", not(feature = "spoof-mac")))]
-const TOTAL_STEPS: u8 = 4;
-
-#[cfg(all(target_os = "uefi", feature = "spoof-mac"))]
-const STEP_PERSIST: u8 = 5;
-#[cfg(all(target_os = "uefi", not(feature = "spoof-mac")))]
-const STEP_PERSIST: u8 = 4;
+#[cfg(target_os = "uefi")]
+const TOTAL_STEPS: u8 = 4
+    + if cfg!(feature = "spoof-disk") { 1 } else { 0 }
+    + if cfg!(feature = "spoof-mac") { 1 } else { 0 };
 
 // ─── Chainloader Windows Boot Manager ──────────────────────────────────
 
@@ -198,9 +196,10 @@ fn main() -> Status {
     utils::random_init();
 
     let mut ctx = SpooferContext::new();
+    let mut step_num: u8 = 1;
 
     // ─── Step 1 : Rechercher les tables SMBIOS (2.x et/ou 3.0 64-bit) ──
-    gfx::print_step(1, TOTAL_STEPS, "Searching SMBIOS tables");
+    gfx::print_step(step_num, TOTAL_STEPS, "Searching SMBIOS tables");
     ctx.smbios_info = finder::find_smbios_table();
     let info = match ctx.smbios_info {
         Some(info) => {
@@ -217,9 +216,17 @@ fn main() -> Status {
     // IMPORTANT : Toujours lire les valeurs matérielles originales AVANT tout patch
     // afin que l'affichage "orig -> new" et la touche [R] utilisent les vrais originaux !
     ctx.orig = unsafe { patch::read_originals_info(&info) };
+    #[cfg(feature = "spoof-disk")]
+    {
+        ctx.orig.disk_count = spoof_disk::read_original_disks(
+            &mut ctx.orig.first_disk_serial,
+            &mut ctx.orig.first_disk_model,
+        );
+    }
 
     // ─── Step 2 : Charger ou générer le profil de spoof ────────────────
-    gfx::print_step(2, TOTAL_STEPS, "Loading spoof profile");
+    step_num += 1;
+    gfx::print_step(step_num, TOTAL_STEPS, "Loading spoof profile");
     if let Some(mut loaded) = persistence::load_config() {
         if loaded.repair_with_originals(&ctx.orig) {
             let _ = persistence::save_config(&loaded);
@@ -238,14 +245,29 @@ fn main() -> Status {
     }
 
     // ─── Step 3 : Patcher toutes les tables SMBIOS (Types 0,1,2,3,4,11,17)
-    gfx::print_step(3, TOTAL_STEPS, "Patching SMBIOS + RAM tables");
+    step_num += 1;
+    gfx::print_step(step_num, TOTAL_STEPS, "Patching SMBIOS + RAM tables");
     ctx.patch_report = unsafe { patch::patch_all_info(&info, &ctx.config) };
     gfx::print_step_ok();
 
-    // ─── Step 4 : Spoof MAC (opt-in via `--features spoof-mac`) ────────
+    // ─── Step 4 : Spoof Disques NVMe / SATA / AHCI (`EFI_DISK_INFO_PROTOCOL`)
+    #[cfg(feature = "spoof-disk")]
+    {
+        step_num += 1;
+        gfx::print_step(step_num, TOTAL_STEPS, "Spoofing NVMe/SATA disk serials");
+        ctx.disk_spoofed_count = spoof_disk::spoof_disks(&ctx.config);
+        if ctx.disk_spoofed_count > 0 {
+            gfx::print_step_ok();
+        } else {
+            gfx::print_step_skipped();
+        }
+    }
+
+    // ─── Step 5 : Spoof MAC (opt-in via `--features spoof-mac`) ────────
     #[cfg(feature = "spoof-mac")]
     {
-        gfx::print_step(4, TOTAL_STEPS, "Spoofing MAC address");
+        step_num += 1;
+        gfx::print_step(step_num, TOTAL_STEPS, "Spoofing MAC address");
         unsafe {
             ctx.mac_spoofed_count = spoof_net::spoof_mac_via_snp(&ctx.config);
             ctx.nvram_mac_spoofed_count = spoof_net::spoof_nvram_mac_addresses(&ctx.config);
@@ -257,8 +279,9 @@ fn main() -> Status {
         }
     }
 
-    // ─── Step 5 : Sauvegarder en NVRAM + ESP Disk ──────────────────────
-    gfx::print_step(STEP_PERSIST, TOTAL_STEPS, "Persisting spoof profile");
+    // ─── Step final : Sauvegarder en NVRAM + ESP Disk ──────────────────
+    step_num += 1;
+    gfx::print_step(step_num, TOTAL_STEPS, "Persisting spoof profile");
     if !ctx.loaded_from_storage {
         ctx.persist_status = persistence::save_config(&ctx.config);
         if ctx.persist_status.nvram_ok || ctx.persist_status.disk_ok {
@@ -282,6 +305,10 @@ fn main() -> Status {
                 ctx.config.generate_from_originals(&ctx.orig);
                 ctx.loaded_from_storage = false;
                 ctx.patch_report = unsafe { patch::patch_all_info(&info, &ctx.config) };
+                #[cfg(feature = "spoof-disk")]
+                {
+                    ctx.disk_spoofed_count = spoof_disk::spoof_disks(&ctx.config);
+                }
                 #[cfg(feature = "spoof-mac")]
                 unsafe {
                     ctx.mac_spoofed_count = spoof_net::spoof_mac_via_snp(&ctx.config);
