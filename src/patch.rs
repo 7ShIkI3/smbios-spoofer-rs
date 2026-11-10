@@ -41,6 +41,7 @@ pub struct OriginalSmbiosData {
     pub disk_count: usize,
     pub first_disk_serial: [u16; 64],
     pub first_disk_model: [u16; 64],
+    pub mac_address: [u8; 6],
 }
 
 impl Default for OriginalSmbiosData {
@@ -67,6 +68,7 @@ impl Default for OriginalSmbiosData {
             disk_count: 0,
             first_disk_serial: [0u16; 64],
             first_disk_model: [0u16; 64],
+            mac_address: [0u8; 6],
         }
     }
 }
@@ -81,6 +83,8 @@ pub struct PatchReport {
     pub type4_patched: usize,
     pub type11_patched: bool,
     pub type17_patched: usize,
+    pub type22_patched: usize,
+    pub type39_patched: usize,
     pub protocol_synced: bool,
 }
 
@@ -571,6 +575,168 @@ pub unsafe fn patch_type17_at(
     patched_dimms
 }
 
+/// Patche toutes les structures Type 22 (Portable Battery) présentes dans la table
+/// (Serial Number + SBDS 16-bit Serial Number). Crucial sur les PC portables (ASUS, Lenovo, Dell...).
+///
+/// # Safety
+/// `table_address` doit pointer vers une table SMBIOS valide en mémoire.
+pub unsafe fn patch_type22_at(
+    table_address: usize,
+    table_max_length: usize,
+    config: &SpoofConfig,
+) -> usize {
+    let mut patched = 0usize;
+    let seed = if config.oem_seed != 0 {
+        config.oem_seed ^ 0xBA77_E910
+    } else {
+        0xBA77_E910
+    };
+
+    for bat_idx in 0..4 {
+        let Some(table) = smbios::find_by_type_at(
+            table_address,
+            table_max_length,
+            smbios::SMBIOS_TYPE_PORTABLE_BATTERY,
+            bat_idx,
+        ) else {
+            break;
+        };
+        let Some(type22) = table.as_type22() else {
+            continue;
+        };
+
+        let table_ptr = table.ptr.raw as *mut u8;
+        let header_len = table.header_length();
+        let handle = table.handle();
+
+        if type22.serial_number != 0 {
+            let mut orig_bat_serial = [0u16; 64];
+            unsafe {
+                smbios::read_smbios_string(
+                    table_ptr,
+                    header_len,
+                    type22.serial_number,
+                    &mut orig_bat_serial,
+                );
+            }
+            if orig_bat_serial[0] != 0 {
+                let mut new_bat_serial = [0u16; 64];
+                utils::generate_ram_serial_deterministic(
+                    &mut new_bat_serial,
+                    &orig_bat_serial,
+                    seed,
+                    bat_idx as u32,
+                );
+                unsafe {
+                    edit_field_and_sync(
+                        table_ptr,
+                        header_len,
+                        handle,
+                        type22.serial_number,
+                        &new_bat_serial,
+                    );
+                }
+            }
+        }
+
+        // Spoof du champ binaire 16-bit `sbds_serial_number` (offset 0x10..0x11)
+        if header_len >= 0x12 {
+            let sbds_val = ((seed.wrapping_add(bat_idx as u32 * 0x1357)) & 0xFFFF) as u16;
+            let sbds_ptr = unsafe { table_ptr.add(0x10).cast::<u16>() };
+            unsafe {
+                sbds_ptr.write_unaligned(sbds_val | 1);
+            }
+        }
+
+        patched += 1;
+    }
+
+    patched
+}
+
+/// Patche toutes les structures Type 39 (System Power Supply) présentes dans la table
+/// (Serial Number + Asset Tag).
+///
+/// # Safety
+/// `table_address` doit pointer vers une table SMBIOS valide en mémoire.
+pub unsafe fn patch_type39_at(
+    table_address: usize,
+    table_max_length: usize,
+    config: &SpoofConfig,
+) -> usize {
+    let mut patched = 0usize;
+    let seed = if config.oem_seed != 0 {
+        config.oem_seed ^ 0x5053_5539
+    } else {
+        0x5053_5539
+    };
+
+    for psu_idx in 0..4 {
+        let Some(table) = smbios::find_by_type_at(
+            table_address,
+            table_max_length,
+            smbios::SMBIOS_TYPE_POWER_SUPPLY,
+            psu_idx,
+        ) else {
+            break;
+        };
+        let Some(type39) = table.as_type39() else {
+            continue;
+        };
+
+        let table_ptr = table.ptr.raw as *mut u8;
+        let header_len = table.header_length();
+        let handle = table.handle();
+
+        if type39.serial_number != 0 {
+            let mut orig_psu_serial = [0u16; 64];
+            unsafe {
+                smbios::read_smbios_string(
+                    table_ptr,
+                    header_len,
+                    type39.serial_number,
+                    &mut orig_psu_serial,
+                );
+            }
+            if orig_psu_serial[0] != 0 {
+                let mut new_psu_serial = [0u16; 64];
+                utils::generate_ram_serial_deterministic(
+                    &mut new_psu_serial,
+                    &orig_psu_serial,
+                    seed,
+                    psu_idx as u32,
+                );
+                unsafe {
+                    edit_field_and_sync(
+                        table_ptr,
+                        header_len,
+                        handle,
+                        type39.serial_number,
+                        &new_psu_serial,
+                    );
+                }
+            }
+        }
+
+        if type39.asset_tag_number != 0 {
+            let chassis_asset = config.chassis_asset_tag;
+            unsafe {
+                edit_field_and_sync(
+                    table_ptr,
+                    header_len,
+                    handle,
+                    type39.asset_tag_number,
+                    &chassis_asset,
+                );
+            }
+        }
+
+        patched += 1;
+    }
+
+    patched
+}
+
 // ─── API haut niveau (`SmbiosTableInfo` + compatibilité `SmbiosEntry`) ─────
 
 /// Applique tous les patchs SMBIOS sur la table principale (et sur la table secondaire
@@ -590,6 +756,8 @@ pub unsafe fn patch_all_info(info: &SmbiosTableInfo, config: &SpoofConfig) -> Pa
         report.type4_patched = patch_type4_at(info.table_address, info.table_max_length, config);
         report.type11_patched = patch_type11_at(info.table_address, info.table_max_length, config);
         report.type17_patched = patch_type17_at(info.table_address, info.table_max_length, config);
+        report.type22_patched = patch_type22_at(info.table_address, info.table_max_length, config);
+        report.type39_patched = patch_type39_at(info.table_address, info.table_max_length, config);
     }
 
     // Si le firmware expose une seconde table SMBIOS distincte (ex. 32-bit vs 64-bit), la patcher aussi
@@ -602,6 +770,8 @@ pub unsafe fn patch_all_info(info: &SmbiosTableInfo, config: &SpoofConfig) -> Pa
             let _ = patch_type4_at(sec_addr, 0x10000, config);
             let _ = patch_type11_at(sec_addr, 0x10000, config);
             let _ = patch_type17_at(sec_addr, 0x10000, config);
+            let _ = patch_type22_at(sec_addr, 0x10000, config);
+            let _ = patch_type39_at(sec_addr, 0x10000, config);
         }
     }
 
@@ -878,5 +1048,50 @@ mod tests {
         assert_eq!(after.uuid, cfg.uuid);
         assert_ne!(after.first_ram_serial, orig.first_ram_serial);
         assert_eq!(after.ram_dimm_count, 1);
+    }
+
+    #[test]
+    fn test_patch_type22_battery_and_type39_psu() {
+        let mut buf = [0u8; 256];
+        let mut pos = 0usize;
+
+        // Type 22 (Portable Battery), length = 0x16 (22 octets)
+        buf[pos] = smbios::SMBIOS_TYPE_PORTABLE_BATTERY;
+        buf[pos + 1] = 0x16;
+        buf[pos + 2] = 0x22;
+        buf[pos + 3] = 0x00;
+        buf[pos + 0x07] = 1; // serial_number = string 1
+        buf[pos + 0x10] = 0x34; // sbds_serial_number low
+        buf[pos + 0x11] = 0x12; // sbds_serial_number high
+        pos += 0x16;
+        let s22 = b"BAT-998877\0\0";
+        buf[pos..pos + s22.len()].copy_from_slice(s22);
+        pos += s22.len();
+
+        // Type 39 (Power Supply), length = 0x0C (12 octets)
+        buf[pos] = smbios::SMBIOS_TYPE_POWER_SUPPLY;
+        buf[pos + 1] = 0x0C;
+        buf[pos + 2] = 0x39;
+        buf[pos + 3] = 0x00;
+        buf[pos + 0x08] = 1; // serial_number = string 1
+        buf[pos + 0x09] = 2; // asset_tag_number = string 2
+        pos += 0x0C;
+        let s39 = b"PSU-112233\0ASSET-9999\0\0";
+        buf[pos..pos + s39.len()].copy_from_slice(s39);
+        pos += s39.len();
+
+        // Type 127 (End)
+        buf[pos] = smbios::SMBIOS_TYPE_END_OF_TABLE;
+        buf[pos + 1] = 4;
+
+        let mut cfg = SpoofConfig::default();
+        cfg.generate();
+
+        let addr = buf.as_mut_ptr() as usize;
+        let max_len = buf.len();
+        let p22 = unsafe { patch_type22_at(addr, max_len, &cfg) };
+        let p39 = unsafe { patch_type39_at(addr, max_len, &cfg) };
+        assert_eq!(p22, 1);
+        assert_eq!(p39, 1);
     }
 }

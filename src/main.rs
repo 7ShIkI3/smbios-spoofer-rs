@@ -20,7 +20,6 @@ pub mod patch;
 pub mod persistence;
 pub mod smbios;
 pub mod spoof_disk;
-#[cfg(feature = "spoof-mac")]
 pub mod spoof_net;
 pub mod utils;
 
@@ -223,6 +222,10 @@ fn main() -> Status {
             &mut ctx.orig.first_disk_model,
         );
     }
+    #[cfg(feature = "spoof-mac")]
+    {
+        let _ = spoof_net::read_original_mac(&mut ctx.orig.mac_address);
+    }
 
     // ─── Step 2 : Charger ou générer le profil de spoof ────────────────
     step_num += 1;
@@ -246,7 +249,7 @@ fn main() -> Status {
 
     // ─── Step 3 : Patcher toutes les tables SMBIOS (Types 0,1,2,3,4,11,17)
     step_num += 1;
-    gfx::print_step(step_num, TOTAL_STEPS, "Patching SMBIOS + RAM tables");
+    gfx::print_step(step_num, TOTAL_STEPS, "Patching SMBIOS + RAM");
     ctx.patch_report = unsafe { patch::patch_all_info(&info, &ctx.config) };
     gfx::print_step_ok();
 
@@ -254,7 +257,7 @@ fn main() -> Status {
     #[cfg(feature = "spoof-disk")]
     {
         step_num += 1;
-        gfx::print_step(step_num, TOTAL_STEPS, "Spoofing NVMe/SATA disk serials");
+        gfx::print_step(step_num, TOTAL_STEPS, "Spoofing NVMe/SATA disks");
         ctx.disk_spoofed_count = spoof_disk::spoof_disks(&ctx.config);
         if ctx.disk_spoofed_count > 0 {
             gfx::print_step_ok();

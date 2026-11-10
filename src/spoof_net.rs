@@ -1,200 +1,251 @@
-//! Module de spoofing d'adresse MAC via UEFI Simple Network Protocol.
+//! Module de spoofing d'adresse MAC via UEFI Simple Network Protocol (SNP) + NVRAM.
 //!
-//! ## Stratégies
+//! ## Stratégies combinées
 //!
-//! **A) SNP StationAddress()** — Modification pre-boot de la MAC :
-//! - Énumère tous les handles exposant `SimpleNetworkProtocol`
-//! - Pour chaque handle : ouvre le protocole, initialise si nécessaire,
-//!   puis appelle `station_address(false, Some(&new_mac))`.
-//! - Best-effort : loggue les succès/échecs sans bloquer le boot.
-//!
-//! **B) NVRAM MAC detection** — Détection de patterns MAC dans les variables NVRAM :
-//! - Certains firmwares (Dell, Lenovo, HP) cachent les MAC dans des variables NVRAM.
-//! - On vérifie des noms de variables connus et on overwrite si un MAC est détecté.
-//! - Cette approche est limitée car uefi 0.39 n'expose pas GetNextVariableName
-//!   en safe Rust. On utilise une liste statique de noms de variables suspectes.
-//!
-//! ## Limitation
-//! Les changements MAC au niveau UEFI ne survivent PAS à ExitBootServices().
-//! Le driver NDIS Windows réinitialise la MAC depuis le hardware.
-//! Pour une persistance dans Windows, il faut soit :
-//! - Un driver kernel Windows qui hook le NDIS miniport
-//! - Une clé de registre `NetworkAddress` dans HKLM\SYSTEM\...\Class\{4D36E972-...}
-//! - Un firmware qui respecte la MAC "locally administered" après boot OS
+//! 1. **Capture de la MAC matérielle originale (`read_original_mac`)** :
+//!    Sauvegarde l'adresse MAC d'usine (`permanent_address` / `current_address`) en cache
+//!    statique avant tout patch pour l'affichage `orig -> new`.
+//! 2. **SNP `StationAddress()` + Patch direct de `SimpleNetworkMode` en RAM** :
+//!    - Appelle `snp.station_address(false, Some(&efi_mac))` sans éteindre l'interface (`shutdown()`
+//!      réinitialiserait l'adresse sur de nombreux firmwares UNDI).
+//!    - Écrase également en place `mode.current_address` et `mode.permanent_address` dans la
+//!      structure `SimpleNetworkMode` en mémoire DXE.
+//! 3. **Nettoyage / remplacement des variables NVRAM MAC connues** (`NetworkMacAddress`, `MacAddress`, etc.).
 
 use crate::persistence::SpoofConfig;
-use uefi::proto::network::snp::{SimpleNetwork, NetworkState};
-use uefi::proto::network::EfiMacAddr;
-use uefi::Identify;
 
-/// Spoof l'adresse MAC via le Simple Network Protocol.
-///
-/// Parcourt tous les handles SNP disponibles et définit une nouvelle adresse MAC
-/// "locally administered" pour chacun.
-///
-/// Retourne le nombre d'interfaces modifiées avec succès.
+#[cfg(target_os = "uefi")]
+use uefi::Identify;
+#[cfg(target_os = "uefi")]
+use uefi::proto::network::EfiMacAddr;
+#[cfg(target_os = "uefi")]
+use uefi::proto::network::snp::{NetworkMode, NetworkState, SimpleNetwork};
+
+#[cfg(target_os = "uefi")]
+static mut CACHED_ORIG_MAC: [u8; 6] = [0u8; 6];
+#[cfg(target_os = "uefi")]
+static mut CACHED_ORIG_MAC_VALID: bool = false;
+
+/// Lit l'adresse MAC matérielle originale de la première carte réseau UEFI (`SimpleNetwork`)
+/// avant tout spoofing et la met en cache pour les régénérations `[R]`.
+#[cfg(target_os = "uefi")]
+pub fn read_original_mac(out_mac: &mut [u8; 6]) -> bool {
+    unsafe {
+        if *core::ptr::addr_of!(CACHED_ORIG_MAC_VALID) {
+            let cached = &*core::ptr::addr_of!(CACHED_ORIG_MAC);
+            out_mac.copy_from_slice(cached);
+            return true;
+        }
+    }
+
+    let Ok(handles) = uefi::boot::locate_handle_buffer(uefi::boot::SearchType::ByProtocol(
+        &SimpleNetwork::GUID,
+    )) else {
+        return false;
+    };
+
+    for &handle in handles.iter() {
+        let Ok(snp) = uefi::boot::open_protocol_exclusive::<SimpleNetwork>(handle) else {
+            continue;
+        };
+        let mode = snp.mode();
+        let perm = &mode.permanent_address.0[..6];
+        let curr = &mode.current_address.0[..6];
+
+        let chosen = if is_likely_mac_address(perm) {
+            Some(perm)
+        } else if is_likely_mac_address(curr) {
+            Some(curr)
+        } else {
+            None
+        };
+
+        if let Some(mac) = chosen {
+            out_mac.copy_from_slice(mac);
+            unsafe {
+                (*core::ptr::addr_of_mut!(CACHED_ORIG_MAC)).copy_from_slice(mac);
+                *core::ptr::addr_of_mut!(CACHED_ORIG_MAC_VALID) = true;
+            }
+            return true;
+        }
+    }
+
+    false
+}
+
+#[cfg(not(target_os = "uefi"))]
+pub fn read_original_mac(_out_mac: &mut [u8; 6]) -> bool {
+    false
+}
+
+/// Spoofe l'adresse MAC via le protocole UEFI `SimpleNetwork` (SNP) et patche la structure
+/// `SimpleNetworkMode` (`current_address` et `permanent_address`) directement en RAM.
 ///
 /// # Safety
-/// Appelle les fonctions du protocole UEFI SNP. Les modifications sont volatiles
-/// (elles ne survivent pas au boot de l'OS).
+/// Manipule les pointeurs de protocole SNP en mémoire DXE.
+#[cfg(target_os = "uefi")]
 pub unsafe fn spoof_mac_via_snp(config: &SpoofConfig) -> u32 {
-    let mac_local = config.mac_address; // Copie depuis packed struct
+    let mac_local = config.mac_address;
+    if !is_likely_mac_address(&mac_local) {
+        return 0;
+    }
 
-    let handles = match uefi::boot::locate_handle_buffer(
-        uefi::boot::SearchType::ByProtocol(&SimpleNetwork::GUID),
-    ) {
-        Ok(h) => h,
-        Err(_) => return 0,
+    let Ok(handles) = uefi::boot::locate_handle_buffer(uefi::boot::SearchType::ByProtocol(
+        &SimpleNetwork::GUID,
+    )) else {
+        return 0;
     };
 
     let mut count: u32 = 0;
 
-    // HandleBuffer implémente Deref<Target = [Handle]>
-    for &handle in handles.iter() {
-        // Ouvrir le protocole SNP sur ce handle
-        let snp = match uefi::boot::open_protocol_exclusive::<SimpleNetwork>(handle) {
-            Ok(s) => s,
-            Err(_) => continue,
+    for (idx, &handle) in handles.iter().enumerate() {
+        let Ok(snp) = uefi::boot::open_protocol_exclusive::<SimpleNetwork>(handle) else {
+            continue;
         };
 
-        // Vérifier l'état du réseau — doit être Started ou Initialized
         let mode = snp.mode();
         if mode.state == NetworkState::STOPPED {
-            // Essayer de démarrer l'interface
-            if snp.start().is_err() {
-                continue;
-            }
-            if snp.initialize(0, 0).is_err() {
-                continue;
+            let _ = snp.start();
+        }
+        if snp.mode().state == NetworkState::STARTED {
+            let _ = snp.initialize(0, 0);
+        }
+
+        // Dériver une MAC unique par interface si la machine possède plusieurs NICs
+        let mut nic_mac = mac_local;
+        if idx > 0 {
+            nic_mac[5] = nic_mac[5].wrapping_add(idx as u8);
+        }
+
+        let mut efi_mac = EfiMacAddr([0u8; 32]);
+        efi_mac.0[0..6].copy_from_slice(&nic_mac);
+
+        let station_ok = snp.station_address(false, Some(&efi_mac)).is_ok();
+
+        // Patcher également `current_address` et `permanent_address` dans `NetworkMode` en RAM
+        // (et ne PAS appeler `snp.shutdown()` pour conserver l'état programmé dans le contrôleur UNDI).
+        let mode_ptr = snp.mode() as *const NetworkMode as *mut NetworkMode;
+        if !mode_ptr.is_null() {
+            unsafe {
+                (*mode_ptr).current_address = efi_mac;
+                (*mode_ptr).permanent_address = efi_mac;
             }
         }
 
-        // Construire l'adresse MAC EFI (32 bytes, seuls les 6 premiers sont utilisés)
-        let mut efi_mac = EfiMacAddr([0u8; 32]);
-        efi_mac.0[0..6].copy_from_slice(&mac_local);
-
-        // Définir la nouvelle adresse (reset=false → on ne restaure pas l'originale)
-        if snp.station_address(false, Some(&efi_mac)).is_ok() {
+        if station_ok || !mode_ptr.is_null() {
             count += 1;
         }
-
-        // Shutdown propre (certains firmwares peuvent avoir besoin)
-        let _ = snp.shutdown();
     }
 
     count
 }
 
-/// Variable NVRAM static — noms de variables firmware suspectes.
-const VAR_NET_MAC: &[u16] = &[
-    'N' as u16, 'e' as u16, 't' as u16, 'w' as u16, 'o' as u16, 'r' as u16,
-    'k' as u16, 'M' as u16, 'a' as u16, 'c' as u16, 'A' as u16, 'd' as u16,
-    'd' as u16, 'r' as u16, 'e' as u16, 's' as u16, 's' as u16, 0u16,
-];
+#[cfg(not(target_os = "uefi"))]
+pub unsafe fn spoof_mac_via_snp(_config: &SpoofConfig) -> u32 {
+    0
+}
 
-const VAR_ASSET_TAG: &[u16] = &[
-    'A' as u16, 's' as u16, 's' as u16, 'e' as u16, 't' as u16, 'T' as u16,
-    'a' as u16, 'g' as u16, 0u16,
-];
+/// Noms de variables NVRAM connues contenant des adresses MAC ou tags matériels.
+#[cfg(target_os = "uefi")]
+const VAR_NET_MAC: &uefi::CStr16 = uefi::cstr16!("NetworkMacAddress");
+#[cfg(target_os = "uefi")]
+const VAR_MAC_ADDR: &uefi::CStr16 = uefi::cstr16!("MacAddress");
+#[cfg(target_os = "uefi")]
+const VAR_SYS_MAC: &uefi::CStr16 = uefi::cstr16!("SystemMacAddress");
+#[cfg(target_os = "uefi")]
+const VAR_ASSET_TAG: &uefi::CStr16 = uefi::cstr16!("AssetTag");
 
 /// GUID pour les variables réseau globales EDK2.
+#[cfg(target_os = "uefi")]
 const NETWORK_GUID: uefi::Guid = uefi::Guid::new(
-    [0xD3, 0x90, 0x5A, 0x43], [0xC3, 0xCD], [0x49, 0x48],
-    0x8E, 0x31, [0x3C, 0x28, 0xCA, 0x4F, 0xB1, 0x6B],
+    [0xD3, 0x90, 0x5A, 0x43],
+    [0xC3, 0xCD],
+    [0x49, 0x48],
+    0x8E,
+    0x31,
+    [0x3C, 0x28, 0xCA, 0x4F, 0xB1, 0x6B],
 );
 
-/// GUID vendor Dell pour AssetTag.
+/// GUID vendor Dell pour AssetTag / MAC.
+#[cfg(target_os = "uefi")]
 const DELL_GUID: uefi::Guid = uefi::Guid::new(
-    [0x16, 0x84, 0x1B, 0xDE], [0x5D, 0x89], [0x43, 0x4D],
-    0x92, 0x79, [0x8A, 0xA2, 0x2F, 0xEE, 0x48, 0x46],
+    [0x16, 0x84, 0x1B, 0xDE],
+    [0x5D, 0x89],
+    [0x43, 0x4D],
+    0x92,
+    0x79,
+    [0x8A, 0xA2, 0x2F, 0xEE, 0x48, 0x46],
 );
 
-/// Cherche et nettoie les variables NVRAM contenant potentiellement
-/// des adresses MAC. Best-effort : les échecs sont silencieux.
-///
-/// Retourne le nombre de variables modifiées.
+/// Cherche et écrase les variables NVRAM contenant potentiellement des adresses MAC.
 ///
 /// # Safety
-/// Appelle les UEFI runtime services pour lire/écrire la NVRAM.
-/// Modifier ou supprimer des variables firmware peut avoir des effets
-/// secondaires — on est conservatif : on overwrite avec la MAC spoofée
-/// au lieu de supprimer.
+/// Appelle les UEFI Runtime Services (`GetVariable` / `SetVariable`).
+#[cfg(target_os = "uefi")]
 pub unsafe fn spoof_nvram_mac_addresses(config: &SpoofConfig) -> u32 {
     let mac_local = config.mac_address;
-    let mut count: u32 = 0;
+    if !is_likely_mac_address(&mac_local) {
+        return 0;
+    }
 
+    let mut count: u32 = 0;
     let vendor_nvram = uefi::runtime::VariableVendor(NETWORK_GUID);
     let vendor_dell = uefi::runtime::VariableVendor(DELL_GUID);
-    let vendors: &[uefi::runtime::VariableVendor] = &[vendor_nvram, vendor_dell];
+    let vendor_global = uefi::runtime::VariableVendor::GLOBAL_VARIABLE;
 
-    let var_names: &[&[u16]] = &[VAR_NET_MAC, VAR_ASSET_TAG];
+    let candidates: &[(&uefi::CStr16, &uefi::runtime::VariableVendor)] = &[
+        (VAR_NET_MAC, &vendor_nvram),
+        (VAR_MAC_ADDR, &vendor_nvram),
+        (VAR_SYS_MAC, &vendor_global),
+        (VAR_ASSET_TAG, &vendor_dell),
+    ];
 
-    // Essayer de lire chaque variable et vérifier si elle contient un MAC
-    for (idx, var_name) in var_names.iter().enumerate() {
-        let vendor = &vendors[idx];
+    let attrs = uefi::runtime::VariableAttributes::BOOTSERVICE_ACCESS
+        | uefi::runtime::VariableAttributes::NON_VOLATILE;
 
+    for &(var_name, vendor) in candidates {
         let mut data_buf = [0u8; 64];
-
-        // Convertir le nom u16 en CStr16
-        let cstr_name = uefi::CStr16::from_u16_until_nul(var_name)
-            .unwrap_or(uefi::cstr16!(""));
-
-        let result = uefi::runtime::get_variable(cstr_name, vendor, &mut data_buf);
-
-        if result.is_ok() {
-            // Vérifier si ces données ressemblent à une MAC (6 octets significatifs)
-            if is_likely_mac_address(&data_buf) {
-                // Overwrite avec la MAC spoofée
-                let new_data = mac_local;
-
-                let attrs = uefi::runtime::VariableAttributes::BOOTSERVICE_ACCESS
-                    | uefi::runtime::VariableAttributes::NON_VOLATILE;
-
-                let set_result = uefi::runtime::set_variable(
-                    cstr_name,
-                    vendor,
-                    attrs,
-                    &new_data,
-                );
-
-                if set_result.is_ok() {
-                    count += 1;
-                }
-            }
+        if uefi::runtime::get_variable(var_name, vendor, &mut data_buf).is_ok()
+            && is_likely_mac_address(&data_buf)
+            && uefi::runtime::set_variable(var_name, vendor, attrs, &mac_local).is_ok()
+        {
+            count += 1;
         }
     }
 
     count
 }
 
-/// Vérifie si un buffer de données ressemble à une adresse MAC.
-///
-/// Critères :
-/// - Au moins 6 octets
-/// - Pas tout à zéro
-/// - Pas broadcast (FF:FF:FF:FF:FF:FF)
-fn is_likely_mac_address(data: &[u8]) -> bool {
+#[cfg(not(target_os = "uefi"))]
+pub unsafe fn spoof_nvram_mac_addresses(_config: &SpoofConfig) -> u32 {
+    0
+}
+
+/// Vérifie si un buffer de données ressemble à une adresse MAC unicast valide.
+pub fn is_likely_mac_address(data: &[u8]) -> bool {
     if data.len() < 6 {
         return false;
     }
-
-    // Vérifier les 6 premiers octets
     let mac = &data[..6];
-
-    // Pas tout à zéro
-    if mac.iter().all(|&b| b == 0) {
+    if mac.iter().all(|&b| b == 0) || mac.iter().all(|&b| b == 0xFF) {
         return false;
     }
-
-    // Pas broadcast
-    if mac.iter().all(|&b| b == 0xFF) {
-        return false;
-    }
-
-    // Pas multicast (bit 0 du premier octet)
+    // Bit 0 du premier octet = 1 indique une adresse multicast (sauf 0x01 spécifique)
     if mac[0] & 0x01 != 0 && mac[0] != 0x01 {
         return false;
     }
-
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_likely_mac_address_validation() {
+        assert!(!is_likely_mac_address(&[0, 0, 0, 0, 0, 0]));
+        assert!(!is_likely_mac_address(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]));
+        assert!(!is_likely_mac_address(&[0x03, 0x11, 0x22, 0x33, 0x44, 0x55])); // multicast
+        assert!(is_likely_mac_address(&[0x02, 0xA4, 0x7C, 0x91, 0xE8, 0x3B])); // locally administered unicast
+    }
 }

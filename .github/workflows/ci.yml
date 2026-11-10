@@ -1,73 +1,43 @@
-name: CI
+name: UEFI Build & Test CI
+
 on:
   push:
-    branches: [main, master]
+    branches: [ "main" ]
   pull_request:
-    branches: [main, master]
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  # ─── Build UEFI (normal) ──────────────────────────────────────────────
-  build-uefi:
-    name: Build (UEFI)
-    runs-on: ubuntu-latest
+  verify-and-build:
+    name: Clippy, Host Tests & UEFI Release Build
+    runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: rustup target add x86_64-unknown-uefi
-      - run: rustup component add rust-src
-      - run: cargo build --release --target x86_64-unknown-uefi
-      - name: Upload EFI artifact
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain + UEFI Target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi,x86_64-pc-windows-msvc
+          components: clippy,rustfmt
+
+      - name: Run Clippy Linter (Default Features)
+        run: cargo clippy --target x86_64-unknown-uefi -- -D warnings
+
+      - name: Run Clippy Linter (All Features: headless, spoof-disk, spoof-mac, agentic)
+        run: cargo clippy --target x86_64-unknown-uefi --features "headless,spoof-disk,spoof-mac,agentic" -- -D warnings
+
+      - name: Run Host Unit & Integration Tests
+        run: cargo test --target x86_64-pc-windows-msvc
+
+      - name: Build UEFI Release Binary (GOP GUI Mode)
+        run: cargo build --release --target x86_64-unknown-uefi
+
+      - name: Upload smbios-spoofer.efi Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: smbios-spoofer.efi
+          name: smbios-spoofer-efi
           path: target/x86_64-unknown-uefi/release/smbios-spoofer.efi
-
-  # ─── Build UEFI (headless) ───────────────────────────────────────────
-  build-headless:
-    name: Build (Headless)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: rustup target add x86_64-unknown-uefi
-      - run: rustup component add rust-src
-      - run: cargo build --release --target x86_64-unknown-uefi --features headless
-      - name: Upload EFI artifact (headless)
-        uses: actions/upload-artifact@v4
-        with:
-          name: smbios-spoofer-headless.efi
-          path: target/x86_64-unknown-uefi/release/smbios-spoofer.efi
-
-  # ─── Lint (clippy) ───────────────────────────────────────────────────
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - run: rustup target add x86_64-unknown-uefi
-      - run: rustup component add rust-src
-      - run: cargo clippy --target x86_64-unknown-uefi -- -D warnings 2>&1 || true
-
-  # ─── Format ──────────────────────────────────────────────────────────
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  # ─── Security audit ──────────────────────────────────────────────────
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}

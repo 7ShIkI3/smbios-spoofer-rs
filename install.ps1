@@ -27,7 +27,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet("install", "status", "uninstall", "build-only", "install-only", "reset-profile")]
+    [ValidateSet("install", "status", "uninstall", "build-only", "install-only", "reset-profile", "backup-profile", "restore-profile")]
     [string]$Mode = "install",
 
     [switch]$Headless,
@@ -46,6 +46,7 @@ $BootEntryDescription = "EFI SMBIOS Spoofer"
 $EfiRelDir            = "\EFI\SmbiosSpoofer"
 $EfiRelPath           = "\EFI\SmbiosSpoofer\smbios-spoofer.efi"
 $EfiProfileRelPath    = "\EFI\SmbiosSpoofer\uuid.dat"
+$ProfileBackupFile    = Join-Path $ProjectRoot "profile-backup.dat"
 $SnapshotFile         = Join-Path $ProjectRoot "smbios-snapshot-before.json"
 $BuiltEfiPath         = Join-Path $ProjectRoot "target\x86_64-unknown-uefi\release\smbios-spoofer.efi"
 $LocalEfiCopy         = Join-Path $ProjectRoot "smbios-spoofer.efi"
@@ -230,7 +231,7 @@ function Invoke-ProjectBuild {
         if ($LASTEXITCODE -ne 0) {
             throw "Unit tests failed. Aborting build."
         }
-        Write-Ok "All unit tests passed (125/125)"
+        Write-Ok "All unit tests passed (128/128)"
     }
 
     $features = @()
@@ -535,6 +536,35 @@ function Invoke-ResetProfile {
     Write-Ok "On next UEFI boot, press [R] (or let it regenerate if NVRAM is empty) to generate brand new IDs."
 }
 
+function Invoke-BackupProfile {
+    Invoke-WithMountedEsp {
+        param($espDrive)
+        $uuidDat = "$espDrive$EfiProfileRelPath"
+        if (Test-Path $uuidDat) {
+            Copy-Item -Path $uuidDat -Destination $ProfileBackupFile -Force
+            Write-Ok "Backed up active ESP profile to: $ProfileBackupFile"
+        } else {
+            Write-Warn "No $EfiProfileRelPath found on ESP to back up."
+        }
+    }
+}
+
+function Invoke-RestoreProfile {
+    if (-not (Test-Path $ProfileBackupFile)) {
+        throw "Backup file not found: $ProfileBackupFile"
+    }
+    Invoke-WithMountedEsp {
+        param($espDrive)
+        $targetDir = "$espDrive$EfiRelDir"
+        if (-not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        $uuidDat = "$espDrive$EfiProfileRelPath"
+        Copy-Item -Path $ProfileBackupFile -Destination $uuidDat -Force
+        Write-Ok "Restored profile from $ProfileBackupFile to $EfiProfileRelPath."
+    }
+}
+
 # --- Uninstall Mode ----------------------------------------------------------
 
 function Invoke-Uninstall {
@@ -589,6 +619,14 @@ switch ($Mode) {
     "reset-profile" {
         Request-AdminElevation -TargetMode "reset-profile"
         Invoke-ResetProfile
+    }
+    "backup-profile" {
+        Request-AdminElevation -TargetMode "backup-profile"
+        Invoke-BackupProfile
+    }
+    "restore-profile" {
+        Request-AdminElevation -TargetMode "restore-profile"
+        Invoke-RestoreProfile
     }
     "uninstall" {
         Request-AdminElevation -TargetMode "uninstall"

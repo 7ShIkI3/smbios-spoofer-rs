@@ -29,6 +29,12 @@ pub const DISK_INFO_PROTOCOL_GUID: uefi::Guid = uefi::Guid::from_bytes([
     0xb3, 0xbb, 0x3f, 0x02, 0x91, 0x84, 0x93, 0x27,
 ]);
 
+/// `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL_GUID` = `{52c78312-8edc-4233-98f2-1a1aa5e388a5}`
+pub const NVME_PASS_THRU_PROTOCOL_GUID: uefi::Guid = uefi::Guid::from_bytes([
+    0x12, 0x83, 0xc7, 0x52, 0xdc, 0x8e, 0x33, 0x42,
+    0x98, 0xf2, 0x1a, 0x1a, 0xa5, 0xe3, 0x88, 0xa5,
+]);
+
 /// `EFI_DISK_INFO_NVME_INTERFACE_GUID` = `{3ab14680-5d3f-4a4d-bcdc-cc380018c7f7}`
 pub const DISK_INFO_NVME_INTERFACE_BYTES: [u8; 16] = [
     0x80, 0x46, 0xb1, 0x3a, 0x3f, 0x5d, 0x4d, 0x4a,
@@ -84,6 +90,59 @@ pub struct EfiDiskInfoProtocol {
         ide_channel: *mut u32,
         ide_device: *mut u32,
     ) -> Status,
+}
+
+/// Commande NVMe standard (UEFI Spec `EFI_NVM_EXPRESS_COMMAND`).
+#[repr(C)]
+pub struct EfiNvmExpressCommand {
+    pub cdw0: u32,
+    pub flags: u8,
+    pub rsvd1: [u8; 3],
+    pub nsid: u32,
+    pub cdw2: u32,
+    pub cdw3: u32,
+    pub cdw10: u32,
+    pub cdw11: u32,
+    pub cdw12: u32,
+    pub cdw13: u32,
+    pub cdw14: u32,
+    pub cdw15: u32,
+}
+
+/// Paquet de commande `EFI_NVM_EXPRESS_PASS_THRU_COMMAND_PACKET`.
+#[repr(C)]
+pub struct EfiNvmExpressPassThruCommandPacket {
+    pub command_timeout: u64,
+    pub transfer_buffer: *mut core::ffi::c_void,
+    pub transfer_length: u32,
+    pub metadata_buffer: *mut core::ffi::c_void,
+    pub metadata_length: u32,
+    pub queue_type: u8,
+    pub rsvd: [u8; 7],
+    pub nvme_cmd: *mut EfiNvmExpressCommand,
+    pub nvme_completion: *mut core::ffi::c_void,
+}
+
+/// Protocole UEFI `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL`.
+#[cfg(target_os = "uefi")]
+#[repr(C)]
+#[uefi::proto::unsafe_protocol(NVME_PASS_THRU_PROTOCOL_GUID)]
+pub struct EfiNvmExpressPassThruProtocol {
+    pub mode: *mut c_void,
+    pub pass_thru: unsafe extern "efiapi" fn(
+        this: *mut EfiNvmExpressPassThruProtocol,
+        namespace_id: u32,
+        packet: *mut EfiNvmExpressPassThruCommandPacket,
+        event: *mut c_void,
+    ) -> Status,
+}
+
+/// Vérifie si une commande NVMe Admin correspond à `Identify Controller` (`Opcode == 0x06`, `CNS == 0x01`).
+pub fn is_nvme_admin_identify_controller(queue_type: u8, cdw0: u32, cdw10: u32, transfer_len: u32) -> bool {
+    queue_type == 0
+        && (cdw0 & 0xFF) == 0x06
+        && (cdw10 & 0xFF) == 0x01
+        && (transfer_len as usize) >= NVME_IDENTIFY_SIZE
 }
 
 // ─── Fonctions pures de parsing & patch (NVMe / ATA / SCSI) ─────────────────
@@ -300,6 +359,96 @@ static mut CACHED_ORIG_FIRST_SERIAL: [u16; 64] = [0u16; 64];
 static mut CACHED_ORIG_FIRST_MODEL: [u16; 64] = [0u16; 64];
 #[cfg(target_os = "uefi")]
 static mut CACHED_ORIG_DISK_COUNT: usize = 0;
+
+#[cfg(target_os = "uefi")]
+const MAX_HOOKED_NVME_PASS_THRU: usize = 8;
+
+#[cfg(target_os = "uefi")]
+#[derive(Clone, Copy)]
+struct HookedNvmePassThruSlot {
+    active: bool,
+    protocol_ptr: usize,
+    orig_pass_thru: Option<
+        unsafe extern "efiapi" fn(
+            this: *mut EfiNvmExpressPassThruProtocol,
+            namespace_id: u32,
+            packet: *mut EfiNvmExpressPassThruCommandPacket,
+            event: *mut c_void,
+        ) -> Status,
+    >,
+    spoof_serial: [u16; 64],
+}
+
+#[cfg(target_os = "uefi")]
+impl HookedNvmePassThruSlot {
+    const fn empty() -> Self {
+        Self {
+            active: false,
+            protocol_ptr: 0,
+            orig_pass_thru: None,
+            spoof_serial: [0u16; 64],
+        }
+    }
+}
+
+#[cfg(target_os = "uefi")]
+static mut HOOKED_NVME_PASS_THRU: [HookedNvmePassThruSlot; MAX_HOOKED_NVME_PASS_THRU] =
+    [HookedNvmePassThruSlot::empty(); MAX_HOOKED_NVME_PASS_THRU];
+
+/// Hook UEFI sur `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL.PassThru`.
+/// Intercepte les commandes Admin `Identify Controller` (`Opcode 0x06`, `CNS 0x01`)
+/// et remplace le numéro de série NVMe (`octets 4..24`) dans `TransferBuffer`.
+#[cfg(target_os = "uefi")]
+unsafe extern "efiapi" fn hooked_nvme_pass_thru(
+    this: *mut EfiNvmExpressPassThruProtocol,
+    namespace_id: u32,
+    packet: *mut EfiNvmExpressPassThruCommandPacket,
+    event: *mut c_void,
+) -> Status {
+    let ptr_val = this as usize;
+    let mut slot_opt: Option<HookedNvmePassThruSlot> = None;
+
+    unsafe {
+        let slots_ptr = core::ptr::addr_of!(HOOKED_NVME_PASS_THRU);
+        for i in 0..MAX_HOOKED_NVME_PASS_THRU {
+            let slot = (*slots_ptr)[i];
+            if slot.active && slot.protocol_ptr == ptr_val {
+                slot_opt = Some(slot);
+                break;
+            }
+        }
+    }
+
+    let Some(slot) = slot_opt else {
+        return Status::DEVICE_ERROR;
+    };
+    let Some(orig_fn) = slot.orig_pass_thru else {
+        return Status::UNSUPPORTED;
+    };
+
+    let status = unsafe { orig_fn(this, namespace_id, packet, event) };
+    if status == Status::SUCCESS && !packet.is_null() {
+        unsafe {
+            let pkt = &*packet;
+            if !pkt.nvme_cmd.is_null() && !pkt.transfer_buffer.is_null() {
+                let cmd = &*pkt.nvme_cmd;
+                if is_nvme_admin_identify_controller(
+                    pkt.queue_type,
+                    cmd.cdw0,
+                    cmd.cdw10,
+                    pkt.transfer_length,
+                ) {
+                    let slice = core::slice::from_raw_parts_mut(
+                        pkt.transfer_buffer as *mut u8,
+                        pkt.transfer_length as usize,
+                    );
+                    let _ = patch_nvme_identify_serial(slice, &slot.spoof_serial);
+                }
+            }
+        }
+    }
+    status
+}
 
 /// Hook UEFI sur `EFI_DISK_INFO_PROTOCOL.Identify`.
 /// Appelle la routine `Identify` originale du pilote DXE (NVMe / AHCI / SATA),
@@ -711,6 +860,70 @@ pub fn spoof_disks(config: &SpoofConfig) -> u32 {
         spoofed_count += 1;
     }
 
+    // Hook également tous les contrôleurs `EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL`
+    if let Ok(nvme_handles) =
+        boot::locate_handle_buffer(SearchType::ByProtocol(&NVME_PASS_THRU_PROTOCOL_GUID))
+    {
+        let cfg_disk_serial = config.disk_serial;
+        let cfg_disk_seed = config.disk_serial_seed;
+        for (idx, handle) in nvme_handles.iter().take(MAX_HOOKED_NVME_PASS_THRU).enumerate() {
+            let Ok(mut nvme_proto) = (unsafe {
+                boot::open_protocol::<EfiNvmExpressPassThruProtocol>(
+                    boot::OpenProtocolParams {
+                        handle: *handle,
+                        agent: boot::image_handle(),
+                        controller: None,
+                    },
+                    boot::OpenProtocolAttributes::GetProtocol,
+                )
+            }) else {
+                continue;
+            };
+
+            let nvme_ptr = &mut *nvme_proto as *mut EfiNvmExpressPassThruProtocol;
+            let mut target_serial = [0u16; 64];
+            if idx == 0 && utils::str_len_u16(&cfg_disk_serial) > 0 {
+                target_serial.copy_from_slice(&cfg_disk_serial);
+            } else {
+                utils::generate_disk_serial_deterministic(
+                    &mut target_serial,
+                    &cfg_disk_serial,
+                    cfg_disk_seed,
+                    idx as u32,
+                );
+            }
+
+            unsafe {
+                let slots_ptr = core::ptr::addr_of_mut!(HOOKED_NVME_PASS_THRU);
+                let mut target_slot: Option<usize> = None;
+                for i in 0..MAX_HOOKED_NVME_PASS_THRU {
+                    if (*slots_ptr)[i].active && (*slots_ptr)[i].protocol_ptr == nvme_ptr as usize {
+                        target_slot = Some(i);
+                        break;
+                    }
+                }
+                if target_slot.is_none() {
+                    for i in 0..MAX_HOOKED_NVME_PASS_THRU {
+                        if !(*slots_ptr)[i].active {
+                            target_slot = Some(i);
+                            break;
+                        }
+                    }
+                }
+                if let Some(s_idx) = target_slot {
+                    let slot = &mut (*slots_ptr)[s_idx];
+                    if !slot.active {
+                        slot.active = true;
+                        slot.protocol_ptr = nvme_ptr as usize;
+                        slot.orig_pass_thru = Some((*nvme_ptr).pass_thru);
+                    }
+                    slot.spoof_serial = target_serial;
+                    (*nvme_ptr).pass_thru = hooked_nvme_pass_thru;
+                }
+            }
+        }
+    }
+
     spoofed_count
 }
 
@@ -800,5 +1013,15 @@ mod tests {
         let new_sn = str_to_u16_buf("50026B769988DCBA");
         assert!(patch_scsi_inquiry_serial(&mut inq, &new_sn));
         assert_eq!(&inq[36..56], b"50026B769988DCBA    ");
+    }
+
+    #[test]
+    fn test_nvme_admin_identify_controller_detection() {
+        // Admin queue (0), Opcode 0x06 (Identify), CNS 0x01 (Controller), 4096 bytes
+        assert!(is_nvme_admin_identify_controller(0, 0x0000_0006, 0x0000_0001, 4096));
+        // Non-admin queue (1) -> false
+        assert!(!is_nvme_admin_identify_controller(1, 0x0000_0006, 0x0000_0001, 4096));
+        // Namespace identify (CNS 0x00) -> false
+        assert!(!is_nvme_admin_identify_controller(0, 0x0000_0006, 0x0000_0000, 4096));
     }
 }

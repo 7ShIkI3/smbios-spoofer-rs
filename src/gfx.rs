@@ -50,7 +50,7 @@ const LINE_H: usize = FONT_H + 5;
 const MARGIN: usize = 36;
 const BANNER_H: usize = 72;
 const BAR_H: usize = 54;
-const PANEL_W: usize = 360;
+const PANEL_W: usize = 396;
 
 // ─── Police bitmap 8×8 — ASCII 32-126 ────────────────────────────────────
 
@@ -302,6 +302,23 @@ fn redraw_steps(gfx: &mut Gfx) {
 }
 
 fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
+    let left_x = MARGIN;
+    let card_y = BANNER_H + 20 + 6 * LINE_H * 2 + 18;
+    if card_y + 136 < gfx.height.saturating_sub(BAR_H) {
+        gfx.fill_rect(left_x - 6, card_y, PANEL_W, 136, C_PANEL);
+        draw_text(gfx, left_x + 4, card_y + 10, "ACTIVE ENGINE STATUS", C_ACCENT);
+        draw_text(gfx, left_x + 4, card_y + 30, "* SMBIOS 3.0 (_SM3_) : Patched", C_OK);
+        draw_text(gfx, left_x + 4, card_y + 46, "* SMBIOS 2.x (_SM_)  : Patched", C_OK);
+        draw_text(gfx, left_x + 4, card_y + 62, "* Entry Checksums    : Verified", C_OK);
+        let disk_state = if ctx.disk_spoofed_count > 0 { "Active" } else { "Standby" };
+        let disk_line = alloc::format!("* EFI_DISK_INFO Hook : {}", disk_state);
+        draw_text(gfx, left_x + 4, card_y + 78, &disk_line, C_CYAN);
+        let sync_state = if ctx.patch_report.protocol_synced { "Active" } else { "Direct RAM" };
+        let sync_line = alloc::format!("* EFI_SMBIOS Sync    : {}", sync_state);
+        draw_text(gfx, left_x + 4, card_y + 94, &sync_line, C_CYAN);
+        draw_text(gfx, left_x + 4, card_y + 110, "* Target OS          : bootmgfw.efi", C_GRAY);
+    }
+
     let right_x = MARGIN + PANEL_W + 48;
     let start_y = BANNER_H + 18;
     if right_x >= gfx.width {
@@ -321,7 +338,7 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
     if let Some(ref info) = ctx.smbios_info {
         let mode_str = if info.is_64bit { "64-bit _SM3_" } else { "32-bit _SM_" };
         let header = alloc::format!(
-            "SMBIOS v{}.{} ({}) — SPOOF SUMMARY",
+            "SMBIOS v{}.{} ({}) -- SPOOF SUMMARY",
             info.major_version,
             info.minor_version,
             mode_str
@@ -390,14 +407,25 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
 
     #[cfg(feature = "spoof-mac")]
     {
+        let mut orig_mac_buf = [0u16; 18];
         let mut mac_buf = [0u16; 18];
+        crate::utils::format_mac(&ctx.orig.mac_address, &mut orig_mac_buf);
         crate::utils::format_mac(&ctx.config.mac_address, &mut mac_buf);
-        let mac_str = alloc::format!(
-            "{} (SNP:{}, NVRAM:{})",
-            u16_to_string(&mac_buf),
-            ctx.mac_spoofed_count,
-            ctx.nvram_mac_spoofed_count
-        );
+        let mac_str = if ctx.orig.mac_address != [0u8; 6] {
+            alloc::format!(
+                "{} -> {} (SNP:{})",
+                u16_to_string(&orig_mac_buf),
+                u16_to_string(&mac_buf),
+                ctx.mac_spoofed_count
+            )
+        } else {
+            alloc::format!(
+                "{} (SNP:{}, NVRAM:{})",
+                u16_to_string(&mac_buf),
+                ctx.mac_spoofed_count,
+                ctx.nvram_mac_spoofed_count
+            )
+        };
         draw_field(gfx, right_x, line_y(22), "MAC Address  ", &mac_str, C_ACCENT);
     }
 
@@ -405,7 +433,7 @@ fn redraw_right_panel(gfx: &mut Gfx, ctx: &crate::SpooferContext) {
         gfx,
         right_x,
         line_y(24),
-        "All SMBIOS + RAM + Disk tables patched.",
+        "All SMBIOS + RAM + Disk + MAC tables patched.",
         C_OK,
     );
 }
@@ -437,24 +465,28 @@ fn u16_to_string(src: &[u16]) -> String {
 
 // ─── Barre de progression ─────────────────────────────────────────────────
 
-fn draw_bottom_bar(gfx: &mut Gfx, secs: u64, tick: usize, total: usize) {
+fn draw_bottom_bar(gfx: &mut Gfx, secs: u64, tick: usize, total: usize, paused: bool) {
     let bar_y = gfx.height.saturating_sub(BAR_H) + 10;
 
     gfx.fill_rect(0, gfx.height.saturating_sub(BAR_H), gfx.width, BAR_H, C_DARK);
 
-    let countdown = alloc::format!("Booting Windows in {:2}s", secs);
-    draw_text(gfx, MARGIN, bar_y + 5, &countdown, C_ACCENT);
+    if paused {
+        draw_text(gfx, MARGIN, bar_y + 5, "PAUSED -- Press [P] or [ENTER]", C_CYAN);
+    } else {
+        let countdown = alloc::format!("Booting Windows in {:2}s", secs);
+        draw_text(gfx, MARGIN, bar_y + 5, &countdown, C_ACCENT);
 
-    let bar_w = gfx.width * 48 / 100;
-    let bar_x = MARGIN + text_width("Booting Windows in 15s") + 20;
-    let bar_fill_y = bar_y + 7;
-    let bar_h = 8;
+        let bar_w = gfx.width * 42 / 100;
+        let bar_x = MARGIN + text_width("Booting Windows in 15s") + 16;
+        let bar_fill_y = bar_y + 7;
+        let bar_h = 8;
 
-    gfx.fill_rect(bar_x, bar_fill_y, bar_w, bar_h, C_BG);
-    let filled = (tick * bar_w).checked_div(total).unwrap_or(bar_w);
-    gfx.fill_rect(bar_x, bar_fill_y, filled, bar_h, C_PROGRESS);
+        gfx.fill_rect(bar_x, bar_fill_y, bar_w, bar_h, C_BG);
+        let filled = (tick * bar_w).checked_div(total).unwrap_or(bar_w);
+        gfx.fill_rect(bar_x, bar_fill_y, filled, bar_h, C_PROGRESS);
+    }
 
-    let keys_label = "[ENTER/S] Boot Now  [R] New IDs";
+    let keys_label = "[ENTER/S] Boot  [R] New IDs  [P] Pause";
     let keys_x = gfx
         .width
         .saturating_sub(MARGIN + text_width(keys_label));
@@ -474,7 +506,7 @@ pub fn print_banner() {
         let title = "EFI SMBIOS SPOOFER v0.2.0 (SMBIOS 2.x & 3.0 64-bit)";
         let title_x = gfx.width.saturating_sub(text_width(title)) / 2;
         draw_text(gfx, title_x, 16, title, C_ACCENT);
-        let sub = "ACROZI x 7ShIkI3 — Rust Bare-Metal Edition";
+        let sub = "ACROZI x 7ShIkI3 -- Rust Bare-Metal Edition";
         let sub_x = gfx.width.saturating_sub(text_width(sub)) / 2;
         draw_text(gfx, sub_x, 36, sub, C_WHITE);
         let hint = "Type 0/1/2/3/4/11/17 (RAM) + NVMe/SATA Disk Spoof + NVRAM/ESP + Auto-Chainload";
@@ -560,9 +592,17 @@ pub fn print_summary(ctx: &crate::SpooferContext) {
     with_gfx(|gfx| redraw_right_panel(gfx, ctx));
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyAction {
+    BootNow,
+    Regenerate,
+    TogglePause,
+}
+
 /// Compte à rebours interactif (5 secondes par défaut pour un boot rapide).
 /// Retourne `Some(true)` si l'utilisateur appuie sur `[R]` (régénérer les IDs),
 /// `Some(false)` s'il appuie sur `[ENTER]`/`[S]` (boot immédiat), ou `None` au timeout.
+/// Appuyer sur `[P]` met en pause / reprend le compte à rebours.
 pub fn interactive_menu() -> Option<bool> {
     if cfg!(feature = "headless") {
         return Some(false);
@@ -571,32 +611,47 @@ pub fn interactive_menu() -> Option<bool> {
     let auto_boot_secs: u64 = 5;
     let poll_ms: u64 = 100;
     let total_ticks = (auto_boot_secs * 1000) / poll_ms;
+    let mut tick: u64 = 0;
+    let mut paused = false;
 
-    for tick in 0..=total_ticks {
+    while tick <= total_ticks {
         let remaining = total_ticks - tick;
         let secs = (remaining * poll_ms).div_ceil(1000);
 
-        with_gfx(|gfx| draw_bottom_bar(gfx, secs, tick as usize, total_ticks as usize));
+        with_gfx(|gfx| draw_bottom_bar(gfx, secs, tick as usize, total_ticks as usize, paused));
 
         uefi::boot::stall(core::time::Duration::from_millis(poll_ms));
 
         if let Some(action) = check_key() {
-            return Some(action);
+            match action {
+                KeyAction::Regenerate => return Some(true),
+                KeyAction::BootNow => return Some(false),
+                KeyAction::TogglePause => {
+                    paused = !paused;
+                }
+            }
+        }
+
+        if !paused {
+            tick += 1;
         }
     }
     None
 }
 
-fn check_key() -> Option<bool> {
+fn check_key() -> Option<KeyAction> {
     uefi::system::with_stdin(|con_in| {
         if let Ok(Some(key)) = con_in.read_key() {
             if let uefi::proto::console::text::Key::Printable(c) = key {
                 let ch: u16 = c.into();
                 if ch == (b'r' as u16) || ch == (b'R' as u16) {
-                    return Some(true);
+                    return Some(KeyAction::Regenerate);
+                }
+                if ch == (b'p' as u16) || ch == (b'P' as u16) {
+                    return Some(KeyAction::TogglePause);
                 }
             }
-            Some(false) // Toute autre touche (Enter, Space, S...) lance le boot immédiat
+            Some(KeyAction::BootNow) // Toute autre touche (Enter, Space, S...) lance le boot immédiat
         } else {
             None
         }

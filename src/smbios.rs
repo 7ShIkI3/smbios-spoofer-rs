@@ -18,6 +18,8 @@ pub const SMBIOS_TYPE_ENCLOSURE: u8 = 3;
 pub const SMBIOS_TYPE_PROCESSOR: u8 = 4;
 pub const SMBIOS_TYPE_OEM_STRINGS: u8 = 11;
 pub const SMBIOS_TYPE_MEMORY_DEVICE: u8 = 17;
+pub const SMBIOS_TYPE_PORTABLE_BATTERY: u8 = 22;
+pub const SMBIOS_TYPE_POWER_SUPPLY: u8 = 39;
 pub const SMBIOS_TYPE_END_OF_TABLE: u8 = 0x7F;
 
 // GUID de la table SMBIOS 2.x (32-bit) dans la table de configuration UEFI
@@ -443,6 +445,39 @@ pub struct SmbiosType17 {
     pub part_number: u8,                        // 0x1A (Index chaîne)
 }
 
+/// Type 22 : Portable Battery (batterie PC portable)
+#[repr(C, packed)]
+pub struct SmbiosType22 {
+    pub header: SmbiosHeader,             // 0x00..0x03
+    pub location: u8,                     // 0x04 (Index chaîne)
+    pub manufacturer: u8,                 // 0x05 (Index chaîne)
+    pub manufacture_date: u8,             // 0x06 (Index chaîne)
+    pub serial_number: u8,                // 0x07 (Index chaîne ← SPOOF)
+    pub device_name: u8,                  // 0x08 (Index chaîne)
+    pub device_chemistry: u8,             // 0x09 (Enum)
+    pub design_capacity: u16,             // 0x0A..0x0B
+    pub design_voltage: u16,              // 0x0C..0x0D
+    pub sbds_version_number: u8,          // 0x0E (Index chaîne)
+    pub maximum_error: u8,                // 0x0F
+    pub sbds_serial_number: u16,          // 0x10..0x11 (Valeur binaire 16-bit ← SPOOF)
+    pub sbds_manufacture_date: u16,       // 0x12..0x13
+    pub sbds_device_chemistry: u8,        // 0x14 (Index chaîne)
+}
+
+/// Type 39 : System Power Supply (alimentation système / serveur / desktop)
+#[repr(C, packed)]
+pub struct SmbiosType39 {
+    pub header: SmbiosHeader,             // 0x00..0x03
+    pub power_unit_group: u8,             // 0x04
+    pub location: u8,                     // 0x05 (Index chaîne)
+    pub device_name: u8,                  // 0x06 (Index chaîne)
+    pub manufacturer: u8,                 // 0x07 (Index chaîne)
+    pub serial_number: u8,                // 0x08 (Index chaîne ← SPOOF)
+    pub asset_tag_number: u8,             // 0x09 (Index chaîne ← SPOOF)
+    pub model_part_number: u8,            // 0x0A (Index chaîne)
+    pub revision_level: u8,               // 0x0B (Index chaîne)
+}
+
 // ─── Union pour naviguer les structures ────────────────────────────────────
 
 /// Union permettant d'accéder à une structure SMBIOS sous son type concret.
@@ -457,6 +492,8 @@ pub union SmbiosStructPtr {
     pub type4: *const SmbiosType4,
     pub type11: *const SmbiosType11,
     pub type17: *const SmbiosType17,
+    pub type22: *const SmbiosType22,
+    pub type39: *const SmbiosType39,
 }
 
 /// Wrapper typé autour d'un pointeur de structure SMBIOS.
@@ -556,6 +593,24 @@ impl SmbiosStruct {
     pub fn as_type17(&self) -> Option<&SmbiosType17> {
         if self.type_ == SMBIOS_TYPE_MEMORY_DEVICE && self.header_length() >= 0x19 {
             unsafe { Some(&*self.ptr.type17) }
+        } else {
+            None
+        }
+    }
+
+    /// Accède au Type 22 (Portable Battery).
+    pub fn as_type22(&self) -> Option<&SmbiosType22> {
+        if self.type_ == SMBIOS_TYPE_PORTABLE_BATTERY && self.header_length() >= 0x0A {
+            unsafe { Some(&*self.ptr.type22) }
+        } else {
+            None
+        }
+    }
+
+    /// Accède au Type 39 (System Power Supply).
+    pub fn as_type39(&self) -> Option<&SmbiosType39> {
+        if self.type_ == SMBIOS_TYPE_POWER_SUPPLY && self.header_length() >= 0x0A {
+            unsafe { Some(&*self.ptr.type39) }
         } else {
             None
         }
