@@ -22,6 +22,8 @@ pub mod smbios;
 pub mod spoof_disk;
 pub mod spoof_net;
 pub mod utils;
+#[allow(dead_code)]
+pub mod win_disk_patch;
 
 // Modules expérimentaux d'orchestration agentique (inclus en test ou via `--features agentic`)
 #[cfg(any(feature = "agentic", test))]

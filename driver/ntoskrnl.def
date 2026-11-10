@@ -1,0 +1,18 @@
+LIBRARY ntoskrnl.exe
+EXPORTS
+    IoCreateDevice
+    IoDeleteDevice
+    IoGetDeviceObjectPointer
+    IoAttachDeviceToDeviceStackSafe
+    IofCallDriver
+    PoCallDriver
+    PoStartNextPowerIrp
+    ObfDereferenceObject
+    ExGetFirmwareEnvironmentVariable
+    ZwOpenFile
+    ZwReadFile
+    ZwClose
+    memset
+    memcpy
+    memmove
+    memcmp

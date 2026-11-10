@@ -1,7 +1,10 @@
 # Build artifacts
 /target/
+/driver/target/
 *.efi
+*.sys
 smbios-snapshot-before.json
+profile-backup.dat
 
 # IDE
 .vscode/

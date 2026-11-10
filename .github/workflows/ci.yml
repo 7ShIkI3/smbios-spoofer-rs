@@ -36,6 +36,9 @@ jobs:
       - name: Build UEFI Release Binary (GOP GUI Mode)
         run: cargo build --release --target x86_64-unknown-uefi
 
+      - name: Build Windows Kernel WDM Disk Filter Driver (.sys)
+        run: cargo build --release --manifest-path driver/Cargo.toml --target x86_64-pc-windows-msvc
+
       - name: Upload smbios-spoofer.efi Artifact
         uses: actions/upload-artifact@v4
         with:

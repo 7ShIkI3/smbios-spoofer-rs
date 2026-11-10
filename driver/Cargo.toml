@@ -1,0 +1,21 @@
+[package]
+name = "smbios-disk-filter"
+version = "0.2.0"
+edition = "2024"
+description = "Windows Kernel WDM Storage Filter Driver (Ring 0) for NVMe/SATA/SCSI Disk Serial Spoofing"
+autobins = false
+autolib = false
+
+[[bin]]
+name = "smbios-disk-filter"
+path = "src/lib.rs"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = false
