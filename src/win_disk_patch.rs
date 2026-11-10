@@ -36,6 +36,7 @@ pub const IOCTL_SCSI_PASS_THROUGH: u32 = 0x0004_D004;
 pub const STORAGE_DEVICE_PROPERTY: u32 = 0;
 pub const STORAGE_ADAPTER_PROPERTY: u32 = 1;
 pub const STORAGE_DEVICE_ID_PROPERTY: u32 = 2;
+pub const STORAGE_DEVICE_UNIQUE_ID_PROPERTY: u32 = 3;
 pub const STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY: u32 = 49;
 pub const STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY: u32 = 50;
 pub const STORAGE_ADAPTER_SERIAL_NUMBER_PROPERTY: u32 = 56;
@@ -62,6 +63,8 @@ pub const TAG_STORAGE_PROTOCOL_COMMAND: u8 = 5;
 pub const TAG_SMART_RCV_DRIVE_DATA: u8 = 6;
 pub const TAG_ATA_PASS_THROUGH: u8 = 7;
 pub const TAG_SCSI_PASS_THROUGH: u8 = 8;
+pub const TAG_STORAGE_DEVICE_UNIQUE_ID: u8 = 9;
+pub const TAG_GENERIC_SUBSTRING_SCAN: u8 = 10;
 
 /// Inspects an incoming `IRP_MJ_DEVICE_CONTROL` request (`io_control_code` and `system_buffer`)
 /// BEFORE the lower driver overwrites `SystemBuffer`, and returns the completion tag (`TAG_*`)
@@ -82,12 +85,13 @@ pub fn classify_ioctl_request(io_control_code: u32, input_buf: &[u8]) -> u8 {
             match property_id {
                 STORAGE_DEVICE_PROPERTY => TAG_STORAGE_DEVICE_DESCRIPTOR,
                 STORAGE_DEVICE_ID_PROPERTY => TAG_STORAGE_DEVICE_ID_DESCRIPTOR,
+                STORAGE_DEVICE_UNIQUE_ID_PROPERTY => TAG_STORAGE_DEVICE_UNIQUE_ID,
                 STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY
                 | STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY
                 | STORAGE_ADAPTER_PROTOCOL_SPECIFIC_PROPERTY_EX
                 | STORAGE_DEVICE_PROTOCOL_SPECIFIC_PROPERTY_EX => TAG_STORAGE_PROTOCOL_DESCRIPTOR,
                 STORAGE_ADAPTER_SERIAL_NUMBER_PROPERTY => TAG_STORAGE_ADAPTER_SERIAL,
-                _ => TAG_NONE,
+                _ => TAG_GENERIC_SUBSTRING_SCAN,
             }
         }
         IOCTL_STORAGE_PROTOCOL_COMMAND | IOCTL_STORAGE_PROTOCOL_COMMAND_ALT => {
@@ -96,7 +100,14 @@ pub fn classify_ioctl_request(io_control_code: u32, input_buf: &[u8]) -> u8 {
         SMART_RCV_DRIVE_DATA => TAG_SMART_RCV_DRIVE_DATA,
         IOCTL_ATA_PASS_THROUGH => TAG_ATA_PASS_THROUGH,
         IOCTL_SCSI_PASS_THROUGH => TAG_SCSI_PASS_THROUGH,
-        _ => TAG_NONE,
+        _ => {
+            // If METHOD_BUFFERED (low 2 bits == 0), allow substring scan on completion
+            if (io_control_code & 0x3) == 0 {
+                TAG_GENERIC_SUBSTRING_SCAN
+            } else {
+                TAG_NONE
+            }
+        }
     }
 }
 
@@ -275,10 +286,14 @@ pub fn patch_storage_device_id_descriptor(
         if id_size > 0 && id_start + id_size <= buf.len() {
             let id_slice = &mut buf[id_start..id_start + id_size];
             if code_set == 2 || code_set == 3 {
-                // ASCII or UTF-8 VPD 0x83 identifier (often contains Vendor + Model + Serial)
+                // ASCII or UTF-8 VPD 0x83 identifier (often contains Vendor + Model + NSID + Serial)
                 if id_slice.len() >= 20 {
-                    // Patch the trailing serial portion of the ASCII VPD 0x83 string
-                    let tail_start = id_slice.len().saturating_sub(30);
+                    let tail_len = if find_stornvme_nsid_suffix(id_slice).is_some() {
+                        30
+                    } else {
+                        20
+                    };
+                    let tail_start = id_slice.len().saturating_sub(tail_len);
                     patch_ascii_serial_slice(&mut id_slice[tail_start..], new_serial);
                 } else {
                     patch_ascii_serial_slice(id_slice, new_serial);
@@ -494,6 +509,72 @@ pub fn patch_scsi_vpd_inquiry(inq: &mut [u8], new_serial: &[u8; 20]) -> bool {
     false
 }
 
+/// Scans `buf` for any ASCII or UTF-16LE occurrences of the original disk serial prefix
+/// (`orig_serial` trimmed of trailing spaces) and replaces them in-place with `new_serial`.
+///
+/// This catches `StorageDeviceUniqueIdProperty (3)`, `\Device\Spaceport` (`Get-PhysicalDisk`),
+/// and custom vendor IOCTLs that embed the factory serial inside composite descriptors.
+pub fn patch_buffer_occurrences_ascii_and_utf16(
+    buf: &mut [u8],
+    orig_serial: &[u8; 20],
+    new_serial: &[u8; 20],
+) -> bool {
+    // Compute trimmed non-space length of `orig_serial`
+    let mut orig_len = orig_serial.len();
+    while orig_len > 0 && (orig_serial[orig_len - 1] == b' ' || orig_serial[orig_len - 1] == 0) {
+        orig_len -= 1;
+    }
+    if orig_len < 6 || buf.len() < orig_len {
+        return false;
+    }
+
+    let orig_prefix = &orig_serial[..orig_len];
+    let mut patched = false;
+
+    // 1. Scan for ASCII occurrences of `orig_prefix`
+    let mut i = 0usize;
+    while i + orig_len <= buf.len() {
+        if &buf[i..i + orig_len] == orig_prefix {
+            for k in 0..orig_len {
+                let rep = new_serial[k];
+                buf[i + k] = if rep != b' ' && rep != 0 { rep } else { b'0' };
+            }
+            patched = true;
+            i += orig_len;
+        } else {
+            i += 1;
+        }
+    }
+
+    // 2. Scan for UTF-16LE occurrences of `orig_prefix` (`2 * orig_len` bytes)
+    let utf16_len = orig_len * 2;
+    if buf.len() >= utf16_len {
+        let mut j = 0usize;
+        while j + utf16_len <= buf.len() {
+            let mut matches = true;
+            for k in 0..orig_len {
+                if buf[j + k * 2] != orig_prefix[k] || buf[j + k * 2 + 1] != 0 {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                for k in 0..orig_len {
+                    let rep = new_serial[k];
+                    buf[j + k * 2] = if rep != b' ' && rep != 0 { rep } else { b'0' };
+                    buf[j + k * 2 + 1] = 0;
+                }
+                patched = true;
+                j += utf16_len;
+            } else {
+                j += 1;
+            }
+        }
+    }
+
+    patched
+}
+
 #[inline]
 fn write_ata_word_swapped(dst_20: &mut [u8], new_serial: &[u8; 20]) {
     for i in (0..20).step_by(2) {
@@ -592,6 +673,50 @@ mod tests {
         for (i, &b) in new_serial.iter().enumerate() {
             assert_eq!(buf[8 + i * 2], b);
             assert_eq!(buf[8 + i * 2 + 1], 0);
+        }
+    }
+
+    #[test]
+    fn test_patch_vpd83_t10_unique_id_preserves_nsid() {
+        // Exact 68-byte VPD 0x83 string observed on SK Hynix NVMe:
+        // "1C5CHFM001TD3JX013N                         0001CDA7N706410107T15   "
+        let vpd_str = b"1C5CHFM001TD3JX013N                         0001CDA7N706410107T15   ";
+        let mut buf = [0u8; 12 + 16 + 68];
+        let total_size = buf.len() as u32;
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // Version
+        buf[4..8].copy_from_slice(&total_size.to_le_bytes()); // Size
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // NumberOfIdentifiers = 1
+        // STORAGE_IDENTIFIER at offset 12:
+        buf[12..16].copy_from_slice(&2u32.to_le_bytes()); // CodeSet = 2 (Ascii)
+        buf[20..22].copy_from_slice(&68u16.to_le_bytes()); // IdentifierSize = 68
+        buf[28..28 + 68].copy_from_slice(vpd_str);
+
+        let new_serial = b"YF0W826954803M86Y   ";
+        assert!(patch_storage_device_id_descriptor(&mut buf, new_serial, 0x9999));
+        assert_eq!(
+            &buf[28..28 + 68],
+            b"1C5CHFM001TD3JX013N                         0001YF0W826954803M86Y   "
+        );
+    }
+
+    #[test]
+    fn test_patch_buffer_occurrences_ascii_and_utf16() {
+        let orig = b"CDA7N706410107T15   ";
+        let spoof = b"YF0W826954803M86Y   ";
+        let mut buf = [0u8; 128];
+        // Place ASCII at offset 8
+        buf[8..38].copy_from_slice(b"CDA7N706410107T15   _00000001.");
+        // Place UTF-16LE at offset 48
+        for (i, &b) in b"CDA7N706410107T15".iter().enumerate() {
+            buf[48 + i * 2] = b;
+            buf[48 + i * 2 + 1] = 0;
+        }
+
+        assert!(patch_buffer_occurrences_ascii_and_utf16(&mut buf, orig, spoof));
+        assert_eq!(&buf[8..38], b"YF0W826954803M86Y   _00000001.");
+        for (i, &b) in b"YF0W826954803M86Y".iter().enumerate() {
+            assert_eq!(buf[48 + i * 2], b);
+            assert_eq!(buf[48 + i * 2 + 1], 0);
         }
     }
 }

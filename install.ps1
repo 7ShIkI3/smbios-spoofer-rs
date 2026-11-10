@@ -154,6 +154,18 @@ function Get-CurrentSmbiosSnapshot {
         }
     }
 
+    $scsiRegSerial = ""
+    Get-ChildItem "HKLM:\HARDWARE\DEVICEMAP\Scsi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+        if ($p -and $p.SerialNumber -and -not $scsiRegSerial) {
+            $scsiRegSerial = ([string]$p.SerialNumber).Trim()
+        }
+    }
+
+    $machGuid = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name MachineGuid -ErrorAction SilentlyContinue).MachineGuid
+    $hwId     = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SystemInformation" -Name ComputerHardwareId -ErrorAction SilentlyContinue).ComputerHardwareId
+    $procSer  = if ([string]::IsNullOrWhiteSpace($cpu.SerialNumber)) { [string]$cpu.ProcessorId } else { ([string]$cpu.SerialNumber).Trim() }
+
     return [PSCustomObject]@{
         CapturedAt        = (Get-Date).ToString("o")
         UUID              = [string]$csProd.UUID
@@ -166,10 +178,13 @@ function Get-CurrentSmbiosSnapshot {
         BaseboardSerial   = [string]$board.SerialNumber
         ChassisSerial     = [string]$enc.SerialNumber
         ChassisAssetTag   = [string]$enc.SMBIOSAssetTag
-        ProcessorSerial   = [string]$cpu.ProcessorId
+        ProcessorSerial   = $procSer
         BiosManufacturer  = [string]$bios.Manufacturer
         BiosVersion       = [string]$bios.SMBIOSBIOSVersion
         BiosReleaseDate   = if ($bios.ReleaseDate) { $bios.ReleaseDate.ToString("yyyy-MM-dd") } else { "" }
+        ScsiRegSerial     = $scsiRegSerial
+        MachineGuid       = [string]$machGuid
+        ComputerHardwareId= [string]$hwId
         RamModules        = $ramSerials
         DiskDrives        = $diskDrives
     }
@@ -236,7 +251,7 @@ function Invoke-ProjectBuild {
         if ($LASTEXITCODE -ne 0) {
             throw "Unit tests failed. Aborting build."
         }
-        Write-Ok "All unit tests passed (132/132)"
+        Write-Ok "All unit tests passed (134/134)"
     }
 
     $features = @()
@@ -477,8 +492,21 @@ function Install-WindowsDiskFilterDriver {
         $sig = Set-AuthenticodeSignature -FilePath $SystemDriverPath -Certificate $cert -HashAlgorithm SHA256
         Write-Ok "Signed and deployed kernel filter: $SystemDriverPath ($($sig.Status))"
     } catch {
-        Copy-Item -Path $LocalDriverCopy -Destination $SystemDriverPath -Force
-        Write-Warn "Deployed $SystemDriverPath (Authenticode signing note: $($_.Exception.Message))"
+        Stop-Service -Name $DriverServiceName -Force -ErrorAction SilentlyContinue
+        try {
+            Copy-Item -Path $LocalDriverCopy -Destination $SystemDriverPath -Force
+            Write-Warn "Deployed $SystemDriverPath (Authenticode signing note: $($_.Exception.Message))"
+        } catch {
+            # If the running driver image is locked in memory until reboot, stage via pending rename or temp swap
+            $oldDriverTmp = "$SystemDriverPath.old"
+            Remove-Item -Path $oldDriverTmp -Force -ErrorAction SilentlyContinue
+            Rename-Item -Path $SystemDriverPath -NewName "smbios-disk-filter.sys.old" -Force -ErrorAction SilentlyContinue
+            Copy-Item -Path $LocalDriverCopy -Destination $SystemDriverPath -Force
+            if ($cert) {
+                $sig = Set-AuthenticodeSignature -FilePath $SystemDriverPath -Certificate $cert -HashAlgorithm SHA256
+                Write-Ok "Replaced in-use kernel filter on disk: $SystemDriverPath ($($sig.Status))"
+            }
+        }
     }
 
     # 3. Register standalone kernel service (start= system, safe: never causes 0x7B if blocked)
@@ -495,10 +523,48 @@ function Install-WindowsDiskFilterDriver {
     try {
         Start-Service -Name $DriverServiceName -ErrorAction Stop
         Write-Ok "Kernel filter '$DriverServiceName' is RUNNING live! Refreshing WMI storage cache..."
-        Update-StorageProviderCache -DiscoveryLevel Full -ErrorAction SilentlyContinue | Out-Null
     } catch {
-        Write-Warn "Kernel filter '$DriverServiceName' staged for next boot (reboot required after enabling testsigning)."
+        $svcNow = Get-Service -Name $DriverServiceName -ErrorAction SilentlyContinue
+        if ($svcNow -and $svcNow.Status -eq 'Running') {
+            Write-Ok "Kernel filter '$DriverServiceName' is already RUNNING!"
+        } else {
+            Write-Warn "Kernel filter '$DriverServiceName' staged for next boot (reboot required after enabling testsigning)."
+        }
     }
+
+    Sync-WindowsRuntimeRegistry
+}
+
+function Sync-WindowsRuntimeRegistry {
+    if (-not (Test-IsAdmin)) { return }
+    Write-Step "Synchronizing Windows Registry telemetry (DEVICEMAP\Scsi, ComputerHardwareId, MachineGuid)..."
+    $curr = Get-CurrentSmbiosSnapshot
+
+    # 1. Sync HKLM\HARDWARE\DEVICEMAP\Scsi\...\SerialNumber with the spoofed Win32_DiskDrive serial
+    if ($curr.DiskDrives.Count -gt 0 -and $curr.DiskDrives[0].SerialNumber) {
+        $spoofDiskSer = $curr.DiskDrives[0].SerialNumber
+        $regVal = if ($spoofDiskSer -match "_[0-9A-Fa-f]{8}\.$") { $spoofDiskSer } else { $spoofDiskSer.PadRight(20) + "_00000001." }
+        Get-ChildItem "HKLM:\HARDWARE\DEVICEMAP\Scsi" -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue
+            if ($p -and $p.SerialNumber) {
+                Set-ItemProperty -Path $_.PSPath -Name "SerialNumber" -Value $regVal -ErrorAction SilentlyContinue
+            }
+        }
+        Write-Ok "Synced HKLM\HARDWARE\DEVICEMAP\Scsi SerialNumber -> $regVal"
+    }
+
+    # 2. Sync ComputerHardwareId & MachineGuid from spoofed SMBIOS System UUID
+    if (-not [string]::IsNullOrWhiteSpace($curr.UUID) -and $curr.UUID -match "^[0-9A-Fa-f-]{36}$") {
+        $uuidLower = $curr.UUID.ToLower()
+        $uuidBraced = "{$uuidLower}"
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\SystemInformation" -Name "ComputerHardwareId" -Value $uuidBraced -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Cryptography" -Name "MachineGuid" -Value $uuidLower -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\SQMClient" -Name "MachineId" -Value ($uuidBraced.ToUpper()) -ErrorAction SilentlyContinue
+        Write-Ok "Synced ComputerHardwareId & MachineGuid -> $uuidLower"
+    }
+
+    Restart-Service -Name "smphost" -Force -ErrorAction SilentlyContinue
+    Update-StorageProviderCache -DiscoveryLevel Full -ErrorAction SilentlyContinue | Out-Null
 }
 
 function Uninstall-WindowsDiskFilterDriver {
@@ -547,19 +613,25 @@ function Invoke-StatusCheck {
     $prevBiosVen  = if ($prev) { [string]$prev.BiosManufacturer } else { "" }
     $prevBiosVer  = if ($prev) { [string]$prev.BiosVersion } else { "" }
     $prevBiosDate = if ($prev) { [string]$prev.BiosReleaseDate } else { "" }
+    $prevProcSer  = if ($prev) { [string]$prev.ProcessorSerial } else { "" }
+    $prevMachGuid = if ($prev -and $prev.PSObject.Properties["MachineGuid"]) { [string]$prev.MachineGuid } else { "" }
+    $prevHwId     = if ($prev -and $prev.PSObject.Properties["ComputerHardwareId"]) { [string]$prev.ComputerHardwareId } else { "" }
 
     Write-Host ""
-    Write-Host "  --- Current Windows SMBIOS Identifiers ------------------------------" -ForegroundColor Cyan
-    Show-FieldComparison "System UUID"       $curr.UUID             $prevUUID
-    Show-FieldComparison "System Serial"     $curr.SystemSerial     $prevSysSer
-    Show-FieldComparison "System SKU"        $curr.SystemSKU        $prevSysSku
-    Show-FieldComparison "Baseboard Model"   $curr.BaseboardProduct $prevBbProd
-    Show-FieldComparison "Baseboard Serial"  $curr.BaseboardSerial  $prevBbSer
-    Show-FieldComparison "Chassis Serial"    $curr.ChassisSerial    $prevChSer
-    Show-FieldComparison "Chassis AssetTag"  $curr.ChassisAssetTag  $prevChAsset
-    Show-FieldComparison "BIOS Vendor"       $curr.BiosManufacturer $prevBiosVen
-    Show-FieldComparison "BIOS Version"      $curr.BiosVersion      $prevBiosVer
-    Show-FieldComparison "BIOS Date"         $curr.BiosReleaseDate  $prevBiosDate
+    Write-Host "  --- Current Windows SMBIOS & Hardware Identifiers -------------------" -ForegroundColor Cyan
+    Show-FieldComparison "System UUID"       $curr.UUID               $prevUUID
+    Show-FieldComparison "System Serial"     $curr.SystemSerial       $prevSysSer
+    Show-FieldComparison "System SKU"        $curr.SystemSKU          $prevSysSku
+    Show-FieldComparison "Baseboard Model"   $curr.BaseboardProduct   $prevBbProd
+    Show-FieldComparison "Baseboard Serial"  $curr.BaseboardSerial    $prevBbSer
+    Show-FieldComparison "Chassis Serial"    $curr.ChassisSerial      $prevChSer
+    Show-FieldComparison "Chassis AssetTag"  $curr.ChassisAssetTag    $prevChAsset
+    Show-FieldComparison "Processor Serial"  $curr.ProcessorSerial    $prevProcSer
+    Show-FieldComparison "BIOS Vendor"       $curr.BiosManufacturer   $prevBiosVen
+    Show-FieldComparison "BIOS Version"      $curr.BiosVersion        $prevBiosVer
+    Show-FieldComparison "BIOS Date"         $curr.BiosReleaseDate    $prevBiosDate
+    Show-FieldComparison "MachineGuid"       $curr.MachineGuid        $prevMachGuid
+    Show-FieldComparison "HardwareId"        $curr.ComputerHardwareId $prevHwId
 
     for ($i = 0; $i -lt $curr.RamModules.Count; $i++) {
         $rm = $curr.RamModules[$i]
@@ -581,6 +653,10 @@ function Invoke-StatusCheck {
         $currDiskDisplay = "$($dd.SerialNumber) ($($dd.Model))"
         $prevDiskDisplay = if ($prevDiskSerial) { "$prevDiskSerial ($($dd.Model))" } else { "" }
         Show-FieldComparison ("Disk[$i] Serial") $currDiskDisplay $prevDiskDisplay
+    }
+    if ($curr.ScsiRegSerial) {
+        $prevScsi = if ($prev -and $prev.DiskDrives -and @($prev.DiskDrives).Count -gt 0) { [string](@($prev.DiskDrives)[0].SerialNumber) } else { "" }
+        Show-FieldComparison "Disk[0] ScsiReg" $curr.ScsiRegSerial $prevScsi
     }
     Write-Host ""
 

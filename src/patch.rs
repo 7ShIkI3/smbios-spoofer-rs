@@ -384,6 +384,15 @@ pub unsafe fn patch_type4_at(
                     &chassis_asset_tag,
                 );
             }
+            if header_len >= 0x23 {
+                edit_field_and_sync(
+                    table_ptr,
+                    header_len,
+                    handle,
+                    type4.part_number,
+                    &processor_serial,
+                );
+            }
         }
         patched_count += 1;
     }

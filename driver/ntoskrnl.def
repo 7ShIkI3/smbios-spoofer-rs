@@ -2,6 +2,7 @@ LIBRARY ntoskrnl.exe
 EXPORTS
     IoCreateDevice
     IoDeleteDevice
+    IoDetachDevice
     IoGetDeviceObjectPointer
     IoAttachDeviceToDeviceStackSafe
     IofCallDriver
@@ -11,6 +12,9 @@ EXPORTS
     ExGetFirmwareEnvironmentVariable
     ZwOpenFile
     ZwReadFile
+    ZwOpenKey
+    ZwQueryValueKey
+    ZwSetValueKey
     ZwClose
     memset
     memcpy

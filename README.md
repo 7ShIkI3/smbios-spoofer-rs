@@ -9,7 +9,7 @@
   <a href="https://github.com/7ShIkI3/smbios-spoofer-rs/releases"><img src="https://img.shields.io/badge/version-0.2.0-blue.svg?style=for-the-badge&logo=git" alt="Version 0.2.0"></a>
   <a href="https://rust-lang.org"><img src="https://img.shields.io/badge/Rust-1.85%2B-orange.svg?style=for-the-badge&logo=rust" alt="Rust 1.85+"></a>
   <a href="https://uefi.org"><img src="https://img.shields.io/badge/UEFI%20%2B%20WDM-x86__64-2ea44f.svg?style=for-the-badge&logo=windows" alt="UEFI + WDM x86_64"></a>
-  <a href="https://github.com/7ShIkI3/smbios-spoofer-rs/actions"><img src="https://img.shields.io/badge/tests-132%20passed-success.svg?style=for-the-badge&logo=checkmarx" alt="132 Tests Passed"></a>
+  <a href="https://github.com/7ShIkI3/smbios-spoofer-rs/actions"><img src="https://img.shields.io/badge/tests-134%20passed-success.svg?style=for-the-badge&logo=checkmarx" alt="134 Tests Passed"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-informational.svg?style=for-the-badge" alt="License MIT"></a>
 </p>
 
@@ -106,7 +106,7 @@ Because once `winload.efi` calls `ExitBootServices()`, UEFI protocols cease to e
 | **Windows Chainloading** | ❌ Relies on BIOS BootOrder fallback | **✅ Native `bootmgfw.efi` launch with `DevicePath`** |
 | **AMI Aptio Display Bug** | ❌ Text colors ignored (monochrome/gray) | **✅ GOP Framebuffer GUI (RGBx & BGRx auto-detect)** |
 | **Persistence Engine** | ⚠️ Single volume only | **✅ Multi-volume ESP scan (`\EFI\SmbiosSpoofer\uuid.dat` v9)** |
-| **Unit Test Suite & CI** | ❌ None | **✅ 132 Host & Integration Tests + GitHub Actions CI** |
+| **Unit Test Suite & CI** | ❌ None | **✅ 134 Host & Integration Tests + GitHub Actions CI** |
 
 ---
 
